@@ -19,7 +19,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -59,7 +58,7 @@ import java.util.*
 import java.util.concurrent.TimeUnit
 
 // ==========================================
-// 1. VERİ MODELLERİ
+// 1. CANLI VERİ PAKETLERİ
 // ==========================================
 
 data class MemberDto(
@@ -81,73 +80,70 @@ data class MessageDto(
     val timestamp: Long = 0L
 )
 
-data class FamilyDto(
-    val code: String = "",
-    val name: String = "",
-    val maxMembers: Int = 10,
-    val createdAt: Long = 0L,
-    val members: Map<String, MemberDto>? = null,
-    val messages: Map<String, MessageDto>? = null
+// Bulut Paketi (Senkronizasyon Mesajı)
+data class CloudPacket(
+    val eventType: String = "", // "MEMBER_UPDATE" veya "CHAT_MESSAGE"
+    val member: MemberDto? = null,
+    val message: MessageDto? = null,
+    val familyName: String? = null
 )
 
 // ==========================================
-// 2. BULUT VERİ SERVİSİ
+// 2. GERÇEK ZAMANLI KÜRESEL BULUT AĞI (NTFY ENGINE)
 // ==========================================
 
-object CloudSyncService {
-    private const val BASE_URL = "https://ailem-chat-default-rtdb.firebaseio.com/families"
+object LiveMeshNetwork {
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)
         .build()
     private val gson = Gson()
-    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val mediaType = "text/plain; charset=utf-8".toMediaType()
 
-    suspend fun getFamily(code: String): FamilyDto? = withContext(Dispatchers.IO) {
+    private fun getChannelUrl(familyCode: String): String {
+        val clean = familyCode.replace("#", "").lowercase().trim()
+        return "https://ntfy.sh/ailem_room_$clean"
+    }
+
+    // Buluta veri yayınla
+    suspend fun publish(familyCode: String, packet: CloudPacket) = withContext(Dispatchers.IO) {
         try {
-            val safeCode = code.replace("#", "CODE_")
-            val request = Request.Builder().url("$BASE_URL/$safeCode.json").get().build()
+            val url = getChannelUrl(familyCode)
+            val json = gson.toJson(packet)
+            val request = Request.Builder().url(url).post(json.toRequestBody(mediaType)).build()
+            client.newCall(request).execute().close()
+        } catch (_: Exception) {}
+    }
+
+    // Buluttan son olayları çek
+    suspend fun pollEvents(familyCode: String, sinceTimeSec: Long): List<CloudPacket> = withContext(Dispatchers.IO) {
+        val list = mutableListOf<CloudPacket>()
+        try {
+            val url = getChannelUrl(familyCode) + "/json?since=${sinceTimeSec}"
+            val request = Request.Builder().url(url).get().build()
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@withContext null
-                val body = response.body?.string() ?: return@withContext null
-                if (body == "null" || body.isBlank()) return@withContext null
-                gson.fromJson(body, FamilyDto::class.java)
+                if (!response.isSuccessful) return@withContext emptyList()
+                val body = response.body?.string() ?: return@withContext emptyList()
+                body.lines().forEach { line ->
+                    if (line.isNotBlank()) {
+                        try {
+                            val map = gson.fromJson(line, Map::class.java)
+                            if (map["event"] == "message") {
+                                val msgPayload = map["message"]?.toString() ?: ""
+                                val packet = gson.fromJson(msgPayload, CloudPacket::class.java)
+                                list.add(packet)
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
             }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    suspend fun saveFamily(family: FamilyDto) = withContext(Dispatchers.IO) {
-        try {
-            val safeCode = family.code.replace("#", "CODE_")
-            val json = gson.toJson(family)
-            val request = Request.Builder().url("$BASE_URL/$safeCode.json").put(json.toRequestBody(jsonMediaType)).build()
-            client.newCall(request).execute().close()
         } catch (_: Exception) {}
-    }
-
-    suspend fun updateMember(code: String, member: MemberDto) = withContext(Dispatchers.IO) {
-        try {
-            val safeCode = code.replace("#", "CODE_")
-            val json = gson.toJson(member)
-            val request = Request.Builder().url("$BASE_URL/$safeCode/members/${member.id}.json").put(json.toRequestBody(jsonMediaType)).build()
-            client.newCall(request).execute().close()
-        } catch (_: Exception) {}
-    }
-
-    suspend fun sendMessage(code: String, message: MessageDto) = withContext(Dispatchers.IO) {
-        try {
-            val safeCode = code.replace("#", "CODE_")
-            val json = gson.toJson(message)
-            val request = Request.Builder().url("$BASE_URL/$safeCode/messages/${message.id}.json").put(json.toRequestBody(jsonMediaType)).build()
-            client.newCall(request).execute().close()
-        } catch (_: Exception) {}
+        list
     }
 }
 
 // ==========================================
-// 3. VIEWMODEL (ANINDA GEÇİŞ & GÜÇLÜ SENKRONİZASYON)
+// 3. VIEWMODEL
 // ==========================================
 
 class FamilyViewModel : ViewModel() {
@@ -163,15 +159,17 @@ class FamilyViewModel : ViewModel() {
 
     var membersList = mutableStateListOf<MemberDto>()
     var messagesList = mutableStateListOf<MessageDto>()
+    private val messageIds = mutableSetOf<String>()
 
-    var activeTab by mutableStateOf(1) // 0: Aktifler, 1: Sohbet, 2: Harita, 3: Özet
+    var activeTab by mutableStateOf(1)
     var isInCall by mutableStateOf(false)
+    private var lastPollTime = (System.currentTimeMillis() - (6 * 60 * 60 * 1000L)) / 1000L // Son 6 saati al
 
     fun initPrefs(context: Context) {
         val prefs = context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE)
         val savedNick = prefs.getString("nick", "") ?: ""
         val savedCode = prefs.getString("code", "") ?: ""
-        val savedName = prefs.getString("name", "") ?: "Bizim Aile"
+        val savedName = prefs.getString("name", "") ?: "Ailem"
         val savedId = prefs.getString("uid", "") ?: ""
 
         if (savedId.isNotBlank()) userId = savedId else prefs.edit().putString("uid", userId).apply()
@@ -220,23 +218,16 @@ class FamilyViewModel : ViewModel() {
             id = UUID.randomUUID().toString(),
             senderId = "system",
             senderNickname = "Sistem 🌟",
-            text = "$name aile grubu kuruldu! Diğer üyeleri davet etmek için aile kodu: $code",
+            text = "$name grubu kuruldu! Katılma Kodu: $code",
             type = "TEXT",
             timestamp = System.currentTimeMillis()
         )
-        messagesList.add(welcomeMsg)
+        addMessageSafely(welcomeMsg)
 
         viewModelScope.launch {
             val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
-            val newFamily = FamilyDto(
-                code = code,
-                name = name,
-                maxMembers = maxMembers,
-                createdAt = System.currentTimeMillis(),
-                members = mapOf(userId to me),
-                messages = mapOf(welcomeMsg.id to welcomeMsg)
-            )
-            CloudSyncService.saveFamily(newFamily)
+            LiveMeshNetwork.publish(code, CloudPacket("MEMBER_UPDATE", member = me, familyName = name))
+            LiveMeshNetwork.publish(code, CloudPacket("CHAT_MESSAGE", message = welcomeMsg))
             startLiveSync()
         }
     }
@@ -256,14 +247,17 @@ class FamilyViewModel : ViewModel() {
 
         viewModelScope.launch {
             val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
-            CloudSyncService.updateMember(cleanCode, me)
+            LiveMeshNetwork.publish(cleanCode, CloudPacket("MEMBER_UPDATE", member = me))
             startLiveSync()
         }
     }
 
     private fun ensureSelfInMembers() {
         val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
-        if (membersList.none { it.id == userId }) {
+        val idx = membersList.indexOfFirst { it.id == userId }
+        if (idx >= 0) {
+            membersList[idx] = me
+        } else {
             membersList.add(0, me)
         }
     }
@@ -287,45 +281,55 @@ class FamilyViewModel : ViewModel() {
             timestamp = System.currentTimeMillis()
         )
 
-        messagesList.add(newMsg)
+        addMessageSafely(newMsg)
         viewModelScope.launch {
-            CloudSyncService.sendMessage(currentFamilyCode, newMsg)
+            LiveMeshNetwork.publish(currentFamilyCode, CloudPacket("CHAT_MESSAGE", message = newMsg))
+        }
+    }
+
+    private fun addMessageSafely(msg: MessageDto) {
+        if (messageIds.add(msg.id)) {
+            messagesList.add(msg)
         }
     }
 
     private fun startLiveSync() {
         viewModelScope.launch {
             while (isActive && currentFamilyCode.isNotBlank()) {
+                // 1. Kendi canlılık ve konum sinyalimizi buluta bas
                 val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
-                CloudSyncService.updateMember(currentFamilyCode, me)
+                ensureSelfInMembers()
+                LiveMeshNetwork.publish(currentFamilyCode, CloudPacket("MEMBER_UPDATE", member = me, familyName = currentFamilyName))
 
-                val family = CloudSyncService.getFamily(currentFamilyCode)
-                if (family != null) {
-                    if (family.name.isNotBlank()) currentFamilyName = family.name
-
-                    val cloudMembers = family.members?.values?.toList() ?: emptyList()
-                    if (cloudMembers.isNotEmpty()) {
-                        membersList.clear()
-                        membersList.addAll(cloudMembers.sortedByDescending { it.lastSeen })
-                    }
-
-                    val cloudMsgs = family.messages?.values?.toList() ?: emptyList()
-                    if (cloudMsgs.isNotEmpty()) {
-                        val sortedMsgs = cloudMsgs.sortedBy { it.timestamp }
-                        if (sortedMsgs.size != messagesList.size) {
-                            messagesList.clear()
-                            messagesList.addAll(sortedMsgs)
+                // 2. Buluttan diğer aile fertlerinin mesaj ve konumlarını çek
+                val packets = LiveMeshNetwork.pollEvents(currentFamilyCode, lastPollTime)
+                if (packets.isNotEmpty()) {
+                    packets.forEach { packet ->
+                        if (!packet.familyName.isNullOrBlank()) {
+                            currentFamilyName = packet.familyName
+                        }
+                        if (packet.eventType == "MEMBER_UPDATE" && packet.member != null) {
+                            val incoming = packet.member
+                            val existingIndex = membersList.indexOfFirst { it.id == incoming.id }
+                            if (existingIndex >= 0) {
+                                membersList[existingIndex] = incoming
+                            } else {
+                                membersList.add(incoming)
+                            }
+                        } else if (packet.eventType == "CHAT_MESSAGE" && packet.message != null) {
+                            addMessageSafely(packet.message)
                         }
                     }
+                    lastPollTime = (System.currentTimeMillis() / 1000L) - 5
                 }
-                delay(3000)
+                delay(3000) // 3 saniyede bir canlı senkronize et
             }
         }
     }
 }
 
 // ==========================================
-// 4. ANA AKTİVİTE & DARK THEME
+// 4. MAIN ACTIVITY (DARK THEME)
 // ==========================================
 
 class MainActivity : ComponentActivity(), LocationListener {
@@ -337,7 +341,6 @@ class MainActivity : ComponentActivity(), LocationListener {
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
         setContent {
-            // Şık OLED Dark Tema Renkleri
             val darkColors = darkColorScheme(
                 primary = Color(0xFF00E5FF),
                 onPrimary = Color.Black,
@@ -615,7 +618,7 @@ fun FamilyChoiceScreen(
 }
 
 // ==========================================
-// 6. ANA UYGULAMA & 4 SEKME (DARK MODE)
+// 6. ANA PANEL (4 SEKME & CANLI SENKRON)
 // ==========================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -632,7 +635,6 @@ fun MainAppContainer(viewModel: FamilyViewModel) {
                     }
                 },
                 actions = {
-                    // SOS Panik Butonu
                     IconButton(onClick = { viewModel.triggerSos() }) {
                         Icon(
                             Icons.Default.Warning,
@@ -810,7 +812,6 @@ fun ChatTab(viewModel: FamilyViewModel) {
             }
         }
 
-        // Mesaj Giriş Barı
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -869,7 +870,6 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
     val members = viewModel.membersList
     val context = LocalContext.current
 
-    // Koyu Tema Destekli Leaflet Harita
     val htmlMap = remember(members.size, viewModel.myLatitude, viewModel.myLongitude) {
         val sb = StringBuilder()
         sb.append("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>")
@@ -1023,7 +1023,7 @@ fun CallOverlay(onEndCall: () -> Unit) {
                 IconButton(onClick = { isMicMuted = !isMicMuted }, modifier = Modifier.background(if (isMicMuted) Color.Red else Color(0xFF333333), CircleShape)) {
                     Icon(Icons.Default.Phone, null, tint = Color.White)
                 }
-                IconButton(onClick = { isVideoOn = !isVideoOn }, modifier = Modifier.background(if (!isVideoOn) Color.Red else Color(0xFF333333), CircleShape)) {
+                IconButton(onClick = { isVideoOn = !isVideoOn }, modifier = Modifier.background(if (!isVideoOn) Color.Red else Color.DarkGray, CircleShape)) {
                     Icon(Icons.Default.Share, null, tint = Color.White)
                 }
                 IconButton(onClick = onEndCall, modifier = Modifier.background(Color.Red, CircleShape)) {
