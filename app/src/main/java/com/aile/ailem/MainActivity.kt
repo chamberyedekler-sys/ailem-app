@@ -813,7 +813,7 @@ fun WeeklySummaryTab(viewModel: FamilyViewModel) {
                 val timeStr = if (lastMsg != null) timeFormat.format(Date(lastMsg.timestamp)) else "-"
                 Text(text = "${lastMsg?.senderNickname ?: "Henüz mesaj yok"} ($timeStr)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 if (lastMsg != null) {
-                    Text(text = ""${lastMsg.text.ifBlank { "[Medya/Ses]" }}"", fontSize = 14.sp, color = Color.DarkGray)
+                    Text(text = "\"${lastMsg.text.ifBlank { "[Medya/Ses]" }}\"", fontSize = 14.sp, color = Color.DarkGray)
                 }
             }
         }
