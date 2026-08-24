@@ -1,9 +1,23 @@
 package com.aile.ailem
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -19,15 +33,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -40,15 +56,16 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
-
-// ==========================================
-// BULUT VERİ MODELLERİ (GERÇEK VERİ)
-// ==========================================
+import kotlin.math.*
 
 data class MemberDto(
     val id: String = "",
     val nickname: String = "",
-    val lastSeen: Long = 0L
+    val lastSeen: Long = 0L,
+    val latitude: Double = 41.0082,
+    val longitude: Double = 28.9784,
+    val battery: Int = 100,
+    val isSos: Boolean = false
 )
 
 data class MessageDto(
@@ -68,10 +85,6 @@ data class FamilyDto(
     val members: Map<String, MemberDto>? = null,
     val messages: Map<String, MessageDto>? = null
 )
-
-// ==========================================
-// CANLI BULUT VERİ SERVİSİ
-// ==========================================
 
 object CloudSyncService {
     private const val BASE_URL = "https://ailem-chat-default-rtdb.firebaseio.com/families"
@@ -111,7 +124,7 @@ object CloudSyncService {
         }
     }
 
-    suspend fun updateHeartbeat(code: String, member: MemberDto) = withContext(Dispatchers.IO) {
+    suspend fun updateMember(code: String, member: MemberDto) = withContext(Dispatchers.IO) {
         try {
             val safeCode = code.replace("#", "CODE_")
             val json = gson.toJson(member)
@@ -138,23 +151,23 @@ object CloudSyncService {
     }
 }
 
-// ==========================================
-// VIEWMODEL (GERÇEK ZAMANLI SENKRONİZASYON)
-// ==========================================
-
 class FamilyViewModel : ViewModel() {
     var userId by mutableStateOf(UUID.randomUUID().toString().substring(0, 8))
     var currentUserNickname by mutableStateOf("")
     var currentFamilyCode by mutableStateOf("")
     var currentFamilyName by mutableStateOf("")
-    
+
+    var myLatitude by mutableStateOf(41.0082)
+    var myLongitude by mutableStateOf(28.9784)
+    var myBattery by mutableStateOf(100)
+    var isSosActive by mutableStateOf(false)
+
     var membersList = mutableStateListOf<MemberDto>()
     var messagesList = mutableStateListOf<MessageDto>()
-    
+
     var activeTab by mutableStateOf(1)
     var isInCall by mutableStateOf(false)
     var isSyncing by mutableStateOf(false)
-    var errorMessage by mutableStateOf<String?>(null)
 
     fun initPrefs(context: Context) {
         val prefs = context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE)
@@ -167,6 +180,17 @@ class FamilyViewModel : ViewModel() {
         if (savedCode.isNotBlank()) {
             currentFamilyCode = savedCode
             startLiveSync()
+        }
+        updateBattery(context)
+    }
+
+    fun updateBattery(context: Context) {
+        val ifilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val batteryStatus: Intent? = context.registerReceiver(null, ifilter)
+        val level: Int = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale: Int = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        if (level >= 0 && scale > 0) {
+            myBattery = (level * 100) / scale
         }
     }
 
@@ -184,7 +208,7 @@ class FamilyViewModel : ViewModel() {
         viewModelScope.launch {
             isSyncing = true
             val code = generateFamilyCode()
-            val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis())
+            val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
             val newFamily = FamilyDto(
                 code = code,
                 name = name,
@@ -217,14 +241,20 @@ class FamilyViewModel : ViewModel() {
                 currentFamilyCode = family.code
                 currentFamilyName = family.name
                 context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE).edit().putString("code", family.code).apply()
-                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis())
-                CloudSyncService.updateHeartbeat(family.code, me)
+                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
+                CloudSyncService.updateMember(family.code, me)
                 startLiveSync()
                 onResult(true)
             } else {
                 onResult(false)
             }
         }
+    }
+
+    fun triggerSos() {
+        isSosActive = !isSosActive
+        val text = if (isSosActive) "🚨 ACİL DURUM: Konumumu paylaştım, yardıma ihtiyacım var!" else "✅ Acil durum bildirimi sonlandırıldı."
+        sendMessage(text, "SOS")
     }
 
     fun sendMessage(text: String, type: String = "TEXT") {
@@ -239,8 +269,8 @@ class FamilyViewModel : ViewModel() {
             type = type,
             timestamp = System.currentTimeMillis()
         )
-        
-        messagesList.add(newMsg) // Anında UI'a bas
+
+        messagesList.add(newMsg)
         viewModelScope.launch {
             CloudSyncService.sendMessage(currentFamilyCode, newMsg)
         }
@@ -249,21 +279,16 @@ class FamilyViewModel : ViewModel() {
     private fun startLiveSync() {
         viewModelScope.launch {
             while (isActive && currentFamilyCode.isNotBlank()) {
-                // 1. Canlılık Sinyali (Heartbeat)
-                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis())
-                CloudSyncService.updateHeartbeat(currentFamilyCode, me)
+                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
+                CloudSyncService.updateMember(currentFamilyCode, me)
 
-                // 2. Mesajları ve Üyeleri Çek
                 val family = CloudSyncService.getFamily(currentFamilyCode)
                 if (family != null) {
                     currentFamilyName = family.name
-                    
-                    // Üyeleri güncelle
                     val members = family.members?.values?.toList() ?: emptyList()
                     membersList.clear()
                     membersList.addAll(members.sortedByDescending { it.lastSeen })
 
-                    // Mesajları güncelle
                     val msgs = family.messages?.values?.toList() ?: emptyList()
                     val sortedMsgs = msgs.sortedBy { it.timestamp }
                     if (sortedMsgs.size != messagesList.size || sortedMsgs != messagesList.toList()) {
@@ -271,27 +296,43 @@ class FamilyViewModel : ViewModel() {
                         messagesList.addAll(sortedMsgs)
                     }
                 }
-                delay(3000) // 3 saniyede bir canlı senkronizasyon
+                delay(3000)
             }
         }
     }
 }
 
-// ==========================================
-// ANA AKTİVİTE
-// ==========================================
+class MainActivity : ComponentActivity(), LocationListener {
+    private lateinit var locationManager: LocationManager
+    private var vm: FamilyViewModel? = null
 
-class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
         setContent {
             MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF1E88E5))) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val viewModel: FamilyViewModel = viewModel()
-                    val context = androidx.compose.ui.platform.LocalContext.current
+                    vm = viewModel
+                    val context = LocalContext.current
+
+                    val permissionLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.RequestMultiplePermissions()
+                    ) { permissions ->
+                        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true) {
+                            startLocationUpdates()
+                        }
+                    }
 
                     LaunchedEffect(Unit) {
                         viewModel.initPrefs(context)
+                        permissionLauncher.launch(arrayOf(
+                            Manifest.permission.ACCESS_FINE_LOCATION,
+                            Manifest.permission.ACCESS_COARSE_LOCATION,
+                            Manifest.permission.RECORD_AUDIO
+                        ))
                     }
 
                     when {
@@ -313,11 +354,31 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-}
 
-// ==========================================
-// 1. RUMUZ EKRANI
-// ==========================================
+    @SuppressLint("MissingPermission")
+    private fun startLocationUpdates() {
+        try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                
+                val lastKnown = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) 
+                    ?: locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                lastKnown?.let {
+                    vm?.myLatitude = it.latitude
+                    vm?.myLongitude = it.longitude
+                }
+                
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 5000L, 5f, this)
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000L, 5f, this)
+            }
+        } catch (_: Exception) {}
+    }
+
+    override fun onLocationChanged(location: Location) {
+        vm?.myLatitude = location.latitude
+        vm?.myLongitude = location.longitude
+    }
+}
 
 @Composable
 fun NicknameScreen(onContinue: (String) -> Unit) {
@@ -328,15 +389,15 @@ fun NicknameScreen(onContinue: (String) -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(Icons.Default.FamilyRestroom, contentDescription = null, modifier = Modifier.size(90.dp), tint = MaterialTheme.colorScheme.primary)
+        Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(90.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(modifier = Modifier.height(16.dp))
-        Text("Ailem Canlı Sohbet", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-        Text("Ailenizin sizi tanıyacağı isminizi girin", color = Color.Gray, textAlign = TextAlign.Center)
+        Text("Ailem Canlı Takip & Sohbet", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text("Ailenizin sizi tanıyacağı bir isim girin", color = Color.Gray, textAlign = TextAlign.Center)
         Spacer(modifier = Modifier.height(24.dp))
         OutlinedTextField(
             value = name,
             onValueChange = { name = it },
-            label = { Text("Adınız / Rumuzunuz (örn: Ahmet)") },
+            label = { Text("Adınız / Rumuzunuz") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp)
@@ -351,10 +412,6 @@ fun NicknameScreen(onContinue: (String) -> Unit) {
         }
     }
 }
-
-// ==========================================
-// 2. AİLE KURMA / KATILMA EKRANI
-// ==========================================
 
 @Composable
 fun FamilyChoiceScreen(
@@ -376,7 +433,7 @@ fun FamilyChoiceScreen(
             Spacer(modifier = Modifier.height(16.dp))
             Text("Buluta Bağlanılıyor...")
         } else {
-            Text("Aile Bağlantısı", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text("Aile Grubu", fontSize = 22.sp, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(24.dp))
 
             Button(
@@ -384,7 +441,7 @@ fun FamilyChoiceScreen(
                 modifier = Modifier.fillMaxWidth().height(54.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Icon(Icons.Default.AddCircle, contentDescription = null)
+                Icon(Icons.Default.Add, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Yeni Aile Grubu Kur")
             }
@@ -394,7 +451,7 @@ fun FamilyChoiceScreen(
                 modifier = Modifier.fillMaxWidth().height(54.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Icon(Icons.Default.GroupAdd, contentDescription = null)
+                Icon(Icons.Default.Person, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Aile Kodunu Gir (#)")
             }
@@ -409,7 +466,7 @@ fun FamilyChoiceScreen(
             title = { Text("Yeni Aile Grubu") },
             text = {
                 Column {
-                    OutlinedTextField(value = familyName, onValueChange = { familyName = it }, label = { Text("Aile İsmi (örn: Bizim Aile)") }, singleLine = true)
+                    OutlinedTextField(value = familyName, onValueChange = { familyName = it }, label = { Text("Aile İsmi") }, singleLine = true)
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(value = memberLimit, onValueChange = { memberLimit = it }, label = { Text("Kişi Sınırı") }, singleLine = true)
                 }
@@ -456,10 +513,6 @@ fun FamilyChoiceScreen(
     }
 }
 
-// ==========================================
-// 3. ANA EKRAN VE 3 SEKMELİ YAPI
-// ==========================================
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainAppContainer(viewModel: FamilyViewModel) {
@@ -473,9 +526,12 @@ fun MainAppContainer(viewModel: FamilyViewModel) {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { viewModel.triggerSos() }) {
+                        Icon(Icons.Default.Warning, contentDescription = "SOS", tint = if (viewModel.isSosActive) Color.Red else Color.Gray)
+                    }
                     if (viewModel.activeTab == 1) {
                         IconButton(onClick = { viewModel.isInCall = true }) {
-                            Icon(Icons.Default.Phone, contentDescription = "Canlı Görüşme", tint = MaterialTheme.colorScheme.primary)
+                            Icon(Icons.Default.Phone, contentDescription = "Görüşme", tint = MaterialTheme.colorScheme.primary)
                         }
                     }
                 }
@@ -483,17 +539,19 @@ fun MainAppContainer(viewModel: FamilyViewModel) {
         },
         bottomBar = {
             NavigationBar {
-                NavigationBarItem(selected = viewModel.activeTab == 0, onClick = { viewModel.activeTab = 0 }, icon = { Icon(Icons.Default.People, contentDescription = null) }, label = { Text("Aktifler") })
-                NavigationBarItem(selected = viewModel.activeTab == 1, onClick = { viewModel.activeTab = 1 }, icon = { Icon(Icons.Default.Chat, contentDescription = null) }, label = { Text("Sohbet") })
-                NavigationBarItem(selected = viewModel.activeTab == 2, onClick = { viewModel.activeTab = 2 }, icon = { Icon(Icons.Default.Analytics, contentDescription = null) }, label = { Text("Haftalık Özet") })
+                NavigationBarItem(selected = viewModel.activeTab == 0, onClick = { viewModel.activeTab = 0 }, icon = { Icon(Icons.Default.Person, null) }, label = { Text("Aktifler") })
+                NavigationBarItem(selected = viewModel.activeTab == 1, onClick = { viewModel.activeTab = 1 }, icon = { Icon(Icons.Default.Email, null) }, label = { Text("Sohbet") })
+                NavigationBarItem(selected = viewModel.activeTab == 2, onClick = { viewModel.activeTab = 2 }, icon = { Icon(Icons.Default.LocationOn, null) }, label = { Text("Harita") })
+                NavigationBarItem(selected = viewModel.activeTab == 3, onClick = { viewModel.activeTab = 3 }, icon = { Icon(Icons.Default.Info, null) }, label = { Text("Özet") })
             }
         }
     ) { padding ->
         Box(modifier = Modifier.padding(padding)) {
             when (viewModel.activeTab) {
-                0 -> ActiveUsersTab(viewModel.membersList)
+                0 -> ActiveUsersTab(viewModel)
                 1 -> ChatTab(viewModel)
-                2 -> WeeklySummaryTab(viewModel)
+                2 -> LiveMapTab(viewModel)
+                3 -> WeeklySummaryTab(viewModel)
             }
             if (viewModel.isInCall) {
                 CallOverlay(onEndCall = { viewModel.isInCall = false })
@@ -502,12 +560,9 @@ fun MainAppContainer(viewModel: FamilyViewModel) {
     }
 }
 
-// ==========================================
-// SEKME 1: GERÇEK AKTİF KULLANICILAR LİSTESİ
-// ==========================================
-
 @Composable
-fun ActiveUsersTab(members: List<MemberDto>) {
+fun ActiveUsersTab(viewModel: FamilyViewModel) {
+    val members = viewModel.membersList
     val currentTime = System.currentTimeMillis()
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -516,35 +571,43 @@ fun ActiveUsersTab(members: List<MemberDto>) {
             Spacer(modifier = Modifier.height(12.dp))
         }
         items(members) { member ->
-            // Son 20 saniye icinde sinyal verdiyse cevrimici sayilir
-            val isOnline = (currentTime - member.lastSeen) < 20_000
+            val isOnline = (currentTime - member.lastSeen) < 25_000
             val timeAgoStr = if (isOnline) "Şu an Çevrimiçi" else {
                 val diffMins = (currentTime - member.lastSeen) / (1000 * 60)
-                if (diffMins < 60) "$diffMins dakika önce" else "${diffMins / 60} saat önce"
+                if (diffMins < 60) "$diffMins dk önce" else "${diffMins / 60} saat önce"
             }
 
-            Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), shape = RoundedCornerShape(12.dp)) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (member.isSos) Color(0xFFFFEBEE) else MaterialTheme.colorScheme.surfaceVariant
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
                 Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
                             .size(14.dp)
                             .clip(CircleShape)
-                            .background(if (isOnline) Color(0xFF4CAF50) else Color.LightGray)
+                            .background(if (member.isSos) Color.Red else if (isOnline) Color(0xFF4CAF50) else Color.LightGray)
                     )
                     Spacer(modifier = Modifier.width(12.dp))
-                    Column {
-                        Text(member.nickname, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(member.nickname, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            if (member.isSos) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("🚨 SOS", color = Color.Red, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
                         Text(timeAgoStr, fontSize = 12.sp, color = if (isOnline) Color(0xFF2E7D32) else Color.Gray)
                     }
+                    Text("🔋 %${member.battery}", fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 }
             }
         }
     }
 }
-
-// ==========================================
-// SEKME 2: GERÇEK CANLI SOHBET EKRANI
-// ==========================================
 
 @Composable
 fun ChatTab(viewModel: FamilyViewModel) {
@@ -580,7 +643,9 @@ fun ChatTab(viewModel: FamilyViewModel) {
                         Card(
                             shape = RoundedCornerShape(16.dp),
                             colors = CardDefaults.cardColors(
-                                containerColor = if (isMe) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                                containerColor = if (msg.type == "SOS") Color(0xFFFFCDD2)
+                                else if (isMe) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surfaceVariant
                             )
                         ) {
                             Column(modifier = Modifier.padding(10.dp)) {
@@ -589,12 +654,13 @@ fun ChatTab(viewModel: FamilyViewModel) {
                                 }
                                 when (msg.type) {
                                     "TEXT" -> Text(msg.text, fontSize = 15.sp)
+                                    "SOS" -> Text(msg.text, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.Red)
                                     "AUDIO" -> Row(verticalAlignment = Alignment.CenterVertically) {
                                         Icon(Icons.Default.PlayArrow, null)
                                         Text("🎤 Sesli Mesaj", fontSize = 14.sp)
                                     }
                                     "FILE" -> Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Default.AttachFile, null)
+                                        Icon(Icons.Default.Share, null)
                                         Text("📎 Belge / Dosya", fontSize = 14.sp)
                                     }
                                 }
@@ -606,10 +672,9 @@ fun ChatTab(viewModel: FamilyViewModel) {
             }
         }
 
-        // Mesaj Giriş Barı
         Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { viewModel.sendMessage("", "AUDIO") }) { Icon(Icons.Default.Mic, null) }
-            IconButton(onClick = { viewModel.sendMessage("", "FILE") }) { Icon(Icons.Default.AttachFile, null) }
+            IconButton(onClick = { viewModel.sendMessage("", "AUDIO") }) { Icon(Icons.Default.PlayArrow, null) }
+            IconButton(onClick = { viewModel.sendMessage("", "FILE") }) { Icon(Icons.Default.Share, null) }
             OutlinedTextField(
                 value = inputText,
                 onValueChange = { inputText = it },
@@ -631,83 +696,78 @@ fun ChatTab(viewModel: FamilyViewModel) {
     }
 }
 
-// ==========================================
-// SEKME 3: GERÇEK VERİLERDEN HAFTALIK ÖZET
-// ==========================================
-
-@Composable
-fun WeeklySummaryTab(viewModel: FamilyViewModel) {
-    val messages = viewModel.messagesList
-    val now = System.currentTimeMillis()
-    val sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000L)
-    val lastWeekMessages = messages.filter { it.timestamp >= sevenDaysAgo }
-    val lastMsg = messages.lastOrNull()
-    val mediaCount = lastWeekMessages.count { it.type != "TEXT" }
-
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Gerçek Aile Etkileşim Raporu", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Son Mesaj Kartı
-        Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(12.dp)) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text("Son Mesaj Gönderen:", fontSize = 12.sp, color = Color.DarkGray)
-                val timeFormat = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault())
-                val timeStr = if (lastMsg != null) timeFormat.format(Date(lastMsg.timestamp)) else "-"
-                Text(text = "${lastMsg?.senderNickname ?: "Henüz mesaj yok"} ($timeStr)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                if (lastMsg != null) {
-                    Text(text = ""${lastMsg.text.ifBlank { "[Medya/Ses]" }}"", fontSize = 14.sp, color = Color.DarkGray)
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Son 7 Gün Analizi
-        Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text("Son 7 Günlük Gerçek Veriler", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("• Bu Hafta Atılan Toplam Mesaj: ${lastWeekMessages.size} adet")
-                Text("• Paylaşılan Medya (Ses/Dosya): $mediaCount adet")
-                Text("• Aktif Üye Sayısı: ${viewModel.membersList.size} kişi")
-                Text("• Veritabanı Durumu: Aktif & Canlı Senkronize 🟢")
-            }
-        }
-    }
+fun calculateDistanceInKm(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+    val r = 6371.0
+    val dLat = Math.toRadians(lat2 - lat1)
+    val dLon = Math.toRadians(lon2 - lon1)
+    val a = sin(dLat / 2).pow(2.0) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2.0)
+    val c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return r * c
 }
 
-// ==========================================
-// SESLİ/GÖRÜNTÜLÜ GÖRÜŞME MODALI
-// ==========================================
-
 @Composable
-fun CallOverlay(onEndCall: () -> Unit) {
-    var isMicMuted by remember { mutableStateOf(false) }
-    var isVideoOn by remember { mutableStateOf(true) }
-    var isScreenSharing by remember { mutableStateOf(false) }
+fun LiveMapTab(viewModel: FamilyViewModel) {
+    val members = viewModel.membersList
+    val context = LocalContext.current
 
-    Box(modifier = Modifier.fillMaxSize().background(Color(0xE6101010)), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            Icon(imageVector = if (isScreenSharing) Icons.Default.ScreenShare else Icons.Default.AccountCircle, contentDescription = null, modifier = Modifier.size(100.dp), tint = Color.White)
-            Spacer(modifier = Modifier.height(16.dp))
-            Text("Aile Görüşmesi Sürüyor", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text(if (isScreenSharing) "Ekranınızı paylaşıyorsunuz" else "Ses ve Görüntü Aktif", color = Color.LightGray)
-            Spacer(modifier = Modifier.height(48.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                IconButton(onClick = { isMicMuted = !isMicMuted }, modifier = Modifier.background(if (isMicMuted) Color.Red else Color.DarkGray, CircleShape)) {
-                    Icon(if (isMicMuted) Icons.Default.MicOff else Icons.Default.Mic, null, tint = Color.White)
-                }
-                IconButton(onClick = { isVideoOn = !isVideoOn }, modifier = Modifier.background(if (!isVideoOn) Color.Red else Color.DarkGray, CircleShape)) {
-                    Icon(if (isVideoOn) Icons.Default.Videocam else Icons.Default.VideocamOff, null, tint = Color.White)
-                }
-                IconButton(onClick = { isScreenSharing = !isScreenSharing }, modifier = Modifier.background(if (isScreenSharing) MaterialTheme.colorScheme.primary else Color.DarkGray, CircleShape)) {
-                    Icon(Icons.Default.ScreenShare, null, tint = Color.White)
-                }
-                IconButton(onClick = onEndCall, modifier = Modifier.background(Color.Red, CircleShape)) {
-                    Icon(Icons.Default.CallEnd, null, tint = Color.White)
-                }
-            }
+    val htmlMap = remember(members.size, viewModel.myLatitude, viewModel.myLongitude) {
+        val markersJs = members.joinToString("\n") { m ->
+            "L.marker([${m.latitude}, ${m.longitude}]).addTo(map).bindPopup('<b>${m.nickname}</b><br>Pil: %${m.battery}');"
         }
+        "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/><script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script><style>body{margin:0;}#map{height:100vh;width:100vw;}</style></head><body><div id='map'></div><script>var map=L.map('map').setView([${viewModel.myLatitude},${viewModel.myLongitude}],14);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);$markersJs</script></body></html>"
     }
-}
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.weight(1.2f).fillMaxWidth()) {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        webViewClient = WebViewClient()
+                        loadDataWithBaseURL(null, htmlMap, "text/html", "UTF-8", null)
+                    }
+                },
+                update = { webView ->
+                    webView.loadDataWithBaseURL(null, htmlMap, "text/html", "UTF-8", null)
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        Card(
+            modifier = Modifier.weight(0.8f).fillMaxWidth(),
+            shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
+        ) {
+            LazyColumn(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+                item {
+                    Text("Aile Konumları & Navigasyon", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                items(members) { m ->
+                    val distKm = calculateDistanceInKm(viewModel.myLatitude, viewModel.myLongitude, m.latitude, m.longitude)
+                    val distStr = if (m.id == viewModel.userId) "Siz (Buradasınız)" else String.format(Locale.US, "%.1f km uzakta", distKm)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.LocationOn, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(m.nickname, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text(distStr, fontSize = 12.sp, color = Color.Gray)
+                        }
+
+                        Button(
+                            onClick = {
+                                val gmmIntentUri = Uri.parse("google.navigation:q=${m.latitude},${m.longitude}")
+                                val mapIntent = Intent(Intent.ACTION_VIEW, gmmIntentUri)
+                                mapIntent.setPackage("com.google.android.apps.maps")
+                                try {
+                                    context.startActivity(mapIntent)
+                                } catch (e: Exception) {
+                                    val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/maps/dir/?api=1&destination=${m.latitude},${m.longitude}"))
+                                    context.startActivity(webIntent)
+                                }
+                            },
+                            shape = RoundedCornerShape(8.dp),
