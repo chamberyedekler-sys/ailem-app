@@ -1,4 +1,115 @@
-package com.aile.ailem
+import os
+
+# 1. settings.gradle.kts
+with open("settings.gradle.kts", "w", encoding="utf-8") as f:
+    f.write("""pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "Ailem"
+include(":app")
+""")
+
+# 2. build.gradle.kts (Root)
+with open("build.gradle.kts", "w", encoding="utf-8") as f:
+    f.write("""plugins {
+    id("com.android.application") version "8.4.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.0" apply false
+}
+""")
+
+# 3. app/build.gradle.kts
+os.makedirs("app", exist_ok=True)
+with open("app/build.gradle.kts", "w", encoding="utf-8") as f:
+    f.write("""plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.aile.ailem"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.aile.ailem"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+    implementation(composeBom)
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+    implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.code.gson:gson:2.11.0")
+}
+""")
+
+# 4. AndroidManifest.xml
+os.makedirs("app/src/main", exist_ok=True)
+with open("app/src/main/AndroidManifest.xml", "w", encoding="utf-8") as f:
+    f.write("""<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application
+        android:allowBackup="true"
+        android:label="Ailem"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>""")
+
+# 5. MainActivity.kt (TAM ÇALIŞAN CANLI SÜRÜM)
+os.makedirs("app/src/main/java/com/aile/ailem", exist_ok=True)
+with open("app/src/main/java/com/aile/ailem/MainActivity.kt", "w", encoding="utf-8") as f:
+    f.write("""package com.aile.ailem
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -713,15 +824,15 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
 
     val htmlMap = remember(members.size, viewModel.myLatitude, viewModel.myLongitude) {
         val sb = StringBuilder()
-        sb.append("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>")
-        sb.append("<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>")
-        sb.append("<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>")
+        sb.append("<!DOCTYPE html><html><head><meta name=\'viewport\' content=\'width=device-width, initial-scale=1.0\'>")
+        sb.append("<link rel=\'stylesheet\' href=\'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\'/>")
+        sb.append("<script src=\'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\'></script>")
         sb.append("<style>body{margin:0;padding:0;}#map{height:100vh;width:100vw;}</style></head><body>")
-        sb.append("<div id='map'></div><script>")
-        sb.append("var map = L.map('map').setView([" + viewModel.myLatitude + ", " + viewModel.myLongitude + "], 14);")
-        sb.append("L.tileLayer('https://tile.openstreetmap.org/' + '{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);")
+        sb.append("<div id=\'map\'></div><script>")
+        sb.append("var map = L.map(\'map\').setView([" + viewModel.myLatitude + ", " + viewModel.myLongitude + "], 14);")
+        sb.append("L.tileLayer(\'https://tile.openstreetmap.org/\' + \'{z}/{x}/{y}.png\', { maxZoom: 19 }).addTo(map);")
         for (m in members) {
-            sb.append("L.marker([" + m.latitude + ", " + m.longitude + "]).addTo(map).bindPopup('<b>" + m.nickname + "</b><br>Pil: %" + m.battery + "');")
+            sb.append("L.marker([" + m.latitude + ", " + m.longitude + "]).addTo(map).bindPopup(\'<b>" + m.nickname + "</b><br>Pil: %" + m.battery + "\');")
         }
         sb.append("</script></body></html>")
         sb.toString()
@@ -813,7 +924,7 @@ fun WeeklySummaryTab(viewModel: FamilyViewModel) {
                 val timeStr = if (lastMsg != null) timeFormat.format(Date(lastMsg.timestamp)) else "-"
                 Text(text = "${lastMsg?.senderNickname ?: "Henüz mesaj yok"} ($timeStr)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 if (lastMsg != null) {
-                    Text(text = ""${lastMsg.text.ifBlank { "[Medya/Ses]" }}"", fontSize = 14.sp, color = Color.DarkGray)
+                    Text(text = "\"${lastMsg.text.ifBlank { "[Medya/Ses]" }}\"", fontSize = 14.sp, color = Color.DarkGray)
                 }
             }
         }
@@ -859,3 +970,47 @@ fun CallOverlay(onEndCall: () -> Unit) {
         }
     }
 }
+""")
+
+# 6. .github/workflows/build_apk.yml
+os.makedirs(".github/workflows", exist_ok=True)
+with open(".github/workflows/build_apk.yml", "w", encoding="utf-8") as f:
+    f.write("""name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept SDK Licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Build APK with Gradle
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ailem-Uygulamasi-APK
+          path: app/build/outputs/apk/debug/*.apk
+""")
+
+print("\n🚀 TÜM DOSYALAR EKSİKSİZ OLUŞTURULDU!")
