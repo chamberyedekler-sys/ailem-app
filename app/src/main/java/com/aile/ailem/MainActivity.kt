@@ -19,6 +19,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -57,6 +58,10 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
 
+// ==========================================
+// 1. VERİ MODELLERİ
+// ==========================================
+
 data class MemberDto(
     val id: String = "",
     val nickname: String = "",
@@ -85,11 +90,15 @@ data class FamilyDto(
     val messages: Map<String, MessageDto>? = null
 )
 
+// ==========================================
+// 2. BULUT VERİ SERVİSİ
+// ==========================================
+
 object CloudSyncService {
     private const val BASE_URL = "https://ailem-chat-default-rtdb.firebaseio.com/families"
     private val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
         .build()
     private val gson = Gson()
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -104,51 +113,42 @@ object CloudSyncService {
                 if (body == "null" || body.isBlank()) return@withContext null
                 gson.fromJson(body, FamilyDto::class.java)
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
 
-    suspend fun saveFamily(family: FamilyDto): Boolean = withContext(Dispatchers.IO) {
+    suspend fun saveFamily(family: FamilyDto) = withContext(Dispatchers.IO) {
         try {
             val safeCode = family.code.replace("#", "CODE_")
             val json = gson.toJson(family)
-            val request = Request.Builder()
-                .url("$BASE_URL/$safeCode.json")
-                .put(json.toRequestBody(jsonMediaType))
-                .build()
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (e: Exception) {
-            false
-        }
+            val request = Request.Builder().url("$BASE_URL/$safeCode.json").put(json.toRequestBody(jsonMediaType)).build()
+            client.newCall(request).execute().close()
+        } catch (_: Exception) {}
     }
 
     suspend fun updateMember(code: String, member: MemberDto) = withContext(Dispatchers.IO) {
         try {
             val safeCode = code.replace("#", "CODE_")
             val json = gson.toJson(member)
-            val request = Request.Builder()
-                .url("$BASE_URL/$safeCode/members/${member.id}.json")
-                .put(json.toRequestBody(jsonMediaType))
-                .build()
+            val request = Request.Builder().url("$BASE_URL/$safeCode/members/${member.id}.json").put(json.toRequestBody(jsonMediaType)).build()
             client.newCall(request).execute().close()
         } catch (_: Exception) {}
     }
 
-    suspend fun sendMessage(code: String, message: MessageDto): Boolean = withContext(Dispatchers.IO) {
+    suspend fun sendMessage(code: String, message: MessageDto) = withContext(Dispatchers.IO) {
         try {
             val safeCode = code.replace("#", "CODE_")
             val json = gson.toJson(message)
-            val request = Request.Builder()
-                .url("$BASE_URL/$safeCode/messages/${message.id}.json")
-                .put(json.toRequestBody(jsonMediaType))
-                .build()
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (e: Exception) {
-            false
-        }
+            val request = Request.Builder().url("$BASE_URL/$safeCode/messages/${message.id}.json").put(json.toRequestBody(jsonMediaType)).build()
+            client.newCall(request).execute().close()
+        } catch (_: Exception) {}
     }
 }
+
+// ==========================================
+// 3. VIEWMODEL (ANINDA GEÇİŞ & GÜÇLÜ SENKRONİZASYON)
+// ==========================================
 
 class FamilyViewModel : ViewModel() {
     var userId by mutableStateOf(UUID.randomUUID().toString().substring(0, 8))
@@ -164,20 +164,22 @@ class FamilyViewModel : ViewModel() {
     var membersList = mutableStateListOf<MemberDto>()
     var messagesList = mutableStateListOf<MessageDto>()
 
-    var activeTab by mutableStateOf(1)
+    var activeTab by mutableStateOf(1) // 0: Aktifler, 1: Sohbet, 2: Harita, 3: Özet
     var isInCall by mutableStateOf(false)
-    var isSyncing by mutableStateOf(false)
 
     fun initPrefs(context: Context) {
         val prefs = context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE)
         val savedNick = prefs.getString("nick", "") ?: ""
         val savedCode = prefs.getString("code", "") ?: ""
+        val savedName = prefs.getString("name", "") ?: "Bizim Aile"
         val savedId = prefs.getString("uid", "") ?: ""
 
         if (savedId.isNotBlank()) userId = savedId else prefs.edit().putString("uid", userId).apply()
         if (savedNick.isNotBlank()) currentUserNickname = savedNick
         if (savedCode.isNotBlank()) {
             currentFamilyCode = savedCode
+            currentFamilyName = savedName
+            ensureSelfInMembers()
             startLiveSync()
         }
         updateBattery(context)
@@ -203,10 +205,28 @@ class FamilyViewModel : ViewModel() {
         return "#" + (1..6).map { chars.random() }.joinToString("")
     }
 
-    fun createFamily(context: Context, name: String, maxMembers: Int, onResult: (String?) -> Unit) {
+    fun createFamily(context: Context, name: String, maxMembers: Int) {
+        val code = generateFamilyCode()
+        currentFamilyCode = code
+        currentFamilyName = name
+
+        context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE).edit()
+            .putString("code", code)
+            .putString("name", name)
+            .apply()
+
+        ensureSelfInMembers()
+        val welcomeMsg = MessageDto(
+            id = UUID.randomUUID().toString(),
+            senderId = "system",
+            senderNickname = "Sistem 🌟",
+            text = "$name aile grubu kuruldu! Diğer üyeleri davet etmek için aile kodu: $code",
+            type = "TEXT",
+            timestamp = System.currentTimeMillis()
+        )
+        messagesList.add(welcomeMsg)
+
         viewModelScope.launch {
-            isSyncing = true
-            val code = generateFamilyCode()
             val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
             val newFamily = FamilyDto(
                 code = code,
@@ -214,39 +234,37 @@ class FamilyViewModel : ViewModel() {
                 maxMembers = maxMembers,
                 createdAt = System.currentTimeMillis(),
                 members = mapOf(userId to me),
-                messages = emptyMap()
+                messages = mapOf(welcomeMsg.id to welcomeMsg)
             )
-            val success = CloudSyncService.saveFamily(newFamily)
-            isSyncing = false
-            if (success) {
-                currentFamilyCode = code
-                currentFamilyName = name
-                context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE).edit().putString("code", code).apply()
-                startLiveSync()
-                onResult(code)
-            } else {
-                onResult(null)
-            }
+            CloudSyncService.saveFamily(newFamily)
+            startLiveSync()
         }
     }
 
-    fun joinFamily(context: Context, code: String, onResult: (Boolean) -> Unit) {
+    fun joinFamily(context: Context, code: String) {
+        val cleanCode = code.trim().uppercase()
+        val defaultName = "Aile Grubu"
+        currentFamilyCode = cleanCode
+        currentFamilyName = defaultName
+
+        context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE).edit()
+            .putString("code", cleanCode)
+            .putString("name", defaultName)
+            .apply()
+
+        ensureSelfInMembers()
+
         viewModelScope.launch {
-            isSyncing = true
-            val cleanCode = code.trim().uppercase()
-            val family = CloudSyncService.getFamily(cleanCode)
-            isSyncing = false
-            if (family != null) {
-                currentFamilyCode = family.code
-                currentFamilyName = family.name
-                context.getSharedPreferences("ailem_prefs", Context.MODE_PRIVATE).edit().putString("code", family.code).apply()
-                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
-                CloudSyncService.updateMember(family.code, me)
-                startLiveSync()
-                onResult(true)
-            } else {
-                onResult(false)
-            }
+            val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
+            CloudSyncService.updateMember(cleanCode, me)
+            startLiveSync()
+        }
+    }
+
+    private fun ensureSelfInMembers() {
+        val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive)
+        if (membersList.none { it.id == userId }) {
+            membersList.add(0, me)
         }
     }
 
@@ -283,16 +301,21 @@ class FamilyViewModel : ViewModel() {
 
                 val family = CloudSyncService.getFamily(currentFamilyCode)
                 if (family != null) {
-                    currentFamilyName = family.name
-                    val members = family.members?.values?.toList() ?: emptyList()
-                    membersList.clear()
-                    membersList.addAll(members.sortedByDescending { it.lastSeen })
+                    if (family.name.isNotBlank()) currentFamilyName = family.name
 
-                    val msgs = family.messages?.values?.toList() ?: emptyList()
-                    val sortedMsgs = msgs.sortedBy { it.timestamp }
-                    if (sortedMsgs.size != messagesList.size || sortedMsgs != messagesList.toList()) {
-                        messagesList.clear()
-                        messagesList.addAll(sortedMsgs)
+                    val cloudMembers = family.members?.values?.toList() ?: emptyList()
+                    if (cloudMembers.isNotEmpty()) {
+                        membersList.clear()
+                        membersList.addAll(cloudMembers.sortedByDescending { it.lastSeen })
+                    }
+
+                    val cloudMsgs = family.messages?.values?.toList() ?: emptyList()
+                    if (cloudMsgs.isNotEmpty()) {
+                        val sortedMsgs = cloudMsgs.sortedBy { it.timestamp }
+                        if (sortedMsgs.size != messagesList.size) {
+                            messagesList.clear()
+                            messagesList.addAll(sortedMsgs)
+                        }
                     }
                 }
                 delay(3000)
@@ -300,6 +323,10 @@ class FamilyViewModel : ViewModel() {
         }
     }
 }
+
+// ==========================================
+// 4. ANA AKTİVİTE & DARK THEME
+// ==========================================
 
 class MainActivity : ComponentActivity(), LocationListener {
     private lateinit var locationManager: LocationManager
@@ -310,7 +337,22 @@ class MainActivity : ComponentActivity(), LocationListener {
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
         setContent {
-            MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF1E88E5))) {
+            // Şık OLED Dark Tema Renkleri
+            val darkColors = darkColorScheme(
+                primary = Color(0xFF00E5FF),
+                onPrimary = Color.Black,
+                primaryContainer = Color(0xFF004D40),
+                onPrimaryContainer = Color(0xFFE0F7FA),
+                secondary = Color(0xFFFF5252),
+                background = Color(0xFF121212),
+                surface = Color(0xFF1E1E1E),
+                surfaceVariant = Color(0xFF2C2C2C),
+                onBackground = Color.White,
+                onSurface = Color.White,
+                onSurfaceVariant = Color(0xFFE0E0E0)
+            )
+
+            MaterialTheme(colorScheme = darkColors) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val viewModel: FamilyViewModel = viewModel()
                     vm = viewModel
@@ -340,9 +382,8 @@ class MainActivity : ComponentActivity(), LocationListener {
                         }
                         viewModel.currentFamilyCode.isEmpty() -> {
                             FamilyChoiceScreen(
-                                isSyncing = viewModel.isSyncing,
-                                onFamilyCreated = { name, max, cb -> viewModel.createFamily(context, name, max, cb) },
-                                onFamilyJoined = { code, cb -> viewModel.joinFamily(context, code, cb) }
+                                onFamilyCreated = { name, max -> viewModel.createFamily(context, name, max) },
+                                onFamilyJoined = { code -> viewModel.joinFamily(context, code) }
                             )
                         }
                         else -> {
@@ -359,14 +400,14 @@ class MainActivity : ComponentActivity(), LocationListener {
         try {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
                 ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                
-                val lastKnown = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) 
+
+                val lastKnown = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
                     ?: locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                 lastKnown?.let {
                     vm?.myLatitude = it.latitude
                     vm?.myLongitude = it.longitude
                 }
-                
+
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 5000L, 5f, this)
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000L, 5f, this)
             }
@@ -379,81 +420,104 @@ class MainActivity : ComponentActivity(), LocationListener {
     }
 }
 
+// ==========================================
+// 5. EKRANLAR (DARK MODE & BEYAZ YAZILAR)
+// ==========================================
+
 @Composable
 fun NicknameScreen(onContinue: (String) -> Unit) {
     var name by remember { mutableStateOf("") }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121212))
+            .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(90.dp), tint = MaterialTheme.colorScheme.primary)
+        Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(90.dp), tint = Color(0xFF00E5FF))
         Spacer(modifier = Modifier.height(16.dp))
-        Text("Ailem Canlı Takip & Sohbet", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Text("Ailenizin sizi tanıyacağı bir isim girin", color = Color.Gray, textAlign = TextAlign.Center)
-        Spacer(modifier = Modifier.height(24.dp))
+        Text("Ailem Canlı İletişim", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Spacer(modifier = Modifier.height(6.dp))
+        Text("Ailenizin sizi tanıyacağı bir isim girin", color = Color.LightGray, textAlign = TextAlign.Center, fontSize = 14.sp)
+        Spacer(modifier = Modifier.height(28.dp))
+
         OutlinedTextField(
             value = name,
             onValueChange = { name = it },
-            label = { Text("Adınız / Rumuzunuz") },
+            label = { Text("Adınız / Rumuzunuz (örn: Ahmet)", color = Color.LightGray) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(14.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                focusedBorderColor = Color(0xFF00E5FF),
+                unfocusedBorderColor = Color(0xFF444444),
+                focusedContainerColor = Color(0xFF1E1E1E),
+                unfocusedContainerColor = Color(0xFF1E1E1E)
+            )
         )
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(20.dp))
         Button(
             onClick = { if (name.isNotBlank()) onContinue(name.trim()) },
-            modifier = Modifier.fillMaxWidth().height(50.dp),
-            shape = RoundedCornerShape(12.dp)
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black)
         ) {
-            Text("Giriş Yap", fontSize = 16.sp)
+            Text("Giriş Yap", fontSize = 16.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
 
 @Composable
 fun FamilyChoiceScreen(
-    isSyncing: Boolean,
-    onFamilyCreated: (String, Int, (String?) -> Unit) -> Unit,
-    onFamilyJoined: (String, (Boolean) -> Unit) -> Unit
+    onFamilyCreated: (String, Int) -> Unit,
+    onFamilyJoined: (String) -> Unit
 ) {
     var showCreateDialog by remember { mutableStateOf(false) }
     var showJoinDialog by remember { mutableStateOf(false) }
-    var joinError by remember { mutableStateOf(false) }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121212))
+            .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        if (isSyncing) {
-            CircularProgressIndicator()
-            Spacer(modifier = Modifier.height(16.dp))
-            Text("Buluta Bağlanılıyor...")
-        } else {
-            Text("Aile Grubu", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(24.dp))
+        Icon(Icons.Default.Home, contentDescription = null, modifier = Modifier.size(80.dp), tint = Color(0xFF00E5FF))
+        Spacer(modifier = Modifier.height(16.dp))
+        Text("Aile Alanı", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Spacer(modifier = Modifier.height(8.dp))
+        Text("Yeni bir aile grubu kurun veya mevcut bir koda katılın.", color = Color.LightGray, textAlign = TextAlign.Center)
 
-            Button(
-                onClick = { showCreateDialog = true },
-                modifier = Modifier.fillMaxWidth().height(54.dp),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                Icon(Icons.Default.Add, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Yeni Aile Grubu Kur")
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-            OutlinedButton(
-                onClick = { showJoinDialog = true },
-                modifier = Modifier.fillMaxWidth().height(54.dp),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                Icon(Icons.Default.Person, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Aile Kodunu Gir (#)")
-            }
+        Spacer(modifier = Modifier.height(32.dp))
+
+        Button(
+            onClick = { showCreateDialog = true },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Yeni Aile Grubu Kur", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        OutlinedButton(
+            onClick = { showJoinDialog = true },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF00E5FF)),
+            border = ButtonDefaults.outlinedButtonBorder.copy(brush = androidx.compose.ui.graphics.SolidColor(Color(0xFF00E5FF)))
+        ) {
+            Icon(Icons.Default.Person, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Aile Kodunu Gir (#)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
         }
     }
 
@@ -462,23 +526,51 @@ fun FamilyChoiceScreen(
         var memberLimit by remember { mutableStateOf("10") }
         AlertDialog(
             onDismissRequest = { showCreateDialog = false },
-            title = { Text("Yeni Aile Grubu") },
+            containerColor = Color(0xFF1E1E1E),
+            title = { Text("Yeni Aile Grubu", color = Color.White, fontWeight = FontWeight.Bold) },
             text = {
                 Column {
-                    OutlinedTextField(value = familyName, onValueChange = { familyName = it }, label = { Text("Aile İsmi") }, singleLine = true)
+                    OutlinedTextField(
+                        value = familyName,
+                        onValueChange = { familyName = it },
+                        label = { Text("Aile İsmi (örn: Bizim Aile)", color = Color.LightGray) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00E5FF),
+                            unfocusedBorderColor = Color.Gray
+                        )
+                    )
                     Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(value = memberLimit, onValueChange = { memberLimit = it }, label = { Text("Kişi Sınırı") }, singleLine = true)
+                    OutlinedTextField(
+                        value = memberLimit,
+                        onValueChange = { memberLimit = it },
+                        label = { Text("Kişi Sınırı", color = Color.LightGray) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00E5FF),
+                            unfocusedBorderColor = Color.Gray
+                        )
+                    )
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    if (familyName.isNotBlank()) {
+                Button(
+                    onClick = {
+                        val name = familyName.ifBlank { "Ailem" }
                         val limit = memberLimit.toIntOrNull() ?: 10
-                        onFamilyCreated(familyName, limit) { showCreateDialog = false }
-                    }
-                }) { Text("Oluştur") }
+                        onFamilyCreated(name, limit)
+                        showCreateDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black)
+                ) { Text("Hemen Oluştur", fontWeight = FontWeight.Bold) }
             },
-            dismissButton = { TextButton(onClick = { showCreateDialog = false }) { Text("İptal") } }
+            dismissButton = {
+                TextButton(onClick = { showCreateDialog = false }) { Text("İptal", color = Color.Gray) }
+            }
         )
     }
 
@@ -486,66 +578,108 @@ fun FamilyChoiceScreen(
         var codeInput by remember { mutableStateOf("#") }
         AlertDialog(
             onDismissRequest = { showJoinDialog = false },
-            title = { Text("6 Haneli Aile Kodunu Girin") },
+            containerColor = Color(0xFF1E1E1E),
+            title = { Text("Aile Kodunu Girin", color = Color.White, fontWeight = FontWeight.Bold) },
             text = {
                 Column {
                     OutlinedTextField(
                         value = codeInput,
                         onValueChange = { if (it.length <= 7) codeInput = it.uppercase() },
-                        label = { Text("Aile Kodu") },
-                        placeholder = { Text("#A1B2C3") },
-                        isError = joinError
+                        label = { Text("6 Haneli Aile Kodu", color = Color.LightGray) },
+                        placeholder = { Text("#A1B2C3", color = Color.DarkGray) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00E5FF),
+                            unfocusedBorderColor = Color.Gray
+                        )
                     )
-                    if (joinError) {
-                        Text("Bu kodla bir aile grubu bulunamadı!", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-                    }
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    onFamilyJoined(codeInput) { success ->
-                        if (success) showJoinDialog = false else joinError = true
-                    }
-                }) { Text("Katıl") }
+                Button(
+                    onClick = {
+                        if (codeInput.length >= 2) {
+                            onFamilyJoined(codeInput)
+                            showJoinDialog = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black)
+                ) { Text("Katıl", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showJoinDialog = false }) { Text("İptal", color = Color.Gray) }
             }
         )
     }
 }
 
+// ==========================================
+// 6. ANA UYGULAMA & 4 SEKME (DARK MODE)
+// ==========================================
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainAppContainer(viewModel: FamilyViewModel) {
     Scaffold(
+        containerColor = Color(0xFF121212),
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Text(viewModel.currentFamilyName.ifBlank { "Ailem" }, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        Text("Kod: ${viewModel.currentFamilyCode}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                        Text(viewModel.currentFamilyName.ifBlank { "Ailem" }, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
+                        Text("Aile Kodu: ${viewModel.currentFamilyCode}", fontSize = 12.sp, color = Color(0xFF00E5FF), fontWeight = FontWeight.SemiBold)
                     }
                 },
                 actions = {
+                    // SOS Panik Butonu
                     IconButton(onClick = { viewModel.triggerSos() }) {
-                        Icon(Icons.Default.Warning, contentDescription = "SOS", tint = if (viewModel.isSosActive) Color.Red else Color.Gray)
+                        Icon(
+                            Icons.Default.Warning,
+                            contentDescription = "SOS",
+                            tint = if (viewModel.isSosActive) Color(0xFFFF5252) else Color.Gray,
+                            modifier = Modifier.size(28.dp)
+                        )
                     }
                     if (viewModel.activeTab == 1) {
                         IconButton(onClick = { viewModel.isInCall = true }) {
-                            Icon(Icons.Default.Phone, contentDescription = "Görüşme", tint = MaterialTheme.colorScheme.primary)
+                            Icon(Icons.Default.Phone, contentDescription = "Görüşme", tint = Color(0xFF00E5FF))
                         }
                     }
-                }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF1A1A1A))
             )
         },
         bottomBar = {
-            NavigationBar {
-                NavigationBarItem(selected = viewModel.activeTab == 0, onClick = { viewModel.activeTab = 0 }, icon = { Icon(Icons.Default.Person, null) }, label = { Text("Aktifler") })
-                NavigationBarItem(selected = viewModel.activeTab == 1, onClick = { viewModel.activeTab = 1 }, icon = { Icon(Icons.Default.Email, null) }, label = { Text("Sohbet") })
-                NavigationBarItem(selected = viewModel.activeTab == 2, onClick = { viewModel.activeTab = 2 }, icon = { Icon(Icons.Default.LocationOn, null) }, label = { Text("Harita") })
-                NavigationBarItem(selected = viewModel.activeTab == 3, onClick = { viewModel.activeTab = 3 }, icon = { Icon(Icons.Default.Info, null) }, label = { Text("Özet") })
+            NavigationBar(containerColor = Color(0xFF1A1A1A)) {
+                NavigationBarItem(
+                    selected = viewModel.activeTab == 0,
+                    onClick = { viewModel.activeTab = 0 },
+                    icon = { Icon(Icons.Default.Person, null, tint = if (viewModel.activeTab == 0) Color(0xFF00E5FF) else Color.Gray) },
+                    label = { Text("Aktifler", color = if (viewModel.activeTab == 0) Color(0xFF00E5FF) else Color.Gray) }
+                )
+                NavigationBarItem(
+                    selected = viewModel.activeTab == 1,
+                    onClick = { viewModel.activeTab = 1 },
+                    icon = { Icon(Icons.Default.Email, null, tint = if (viewModel.activeTab == 1) Color(0xFF00E5FF) else Color.Gray) },
+                    label = { Text("Sohbet", color = if (viewModel.activeTab == 1) Color(0xFF00E5FF) else Color.Gray) }
+                )
+                NavigationBarItem(
+                    selected = viewModel.activeTab == 2,
+                    onClick = { viewModel.activeTab = 2 },
+                    icon = { Icon(Icons.Default.LocationOn, null, tint = if (viewModel.activeTab == 2) Color(0xFF00E5FF) else Color.Gray) },
+                    label = { Text("Harita", color = if (viewModel.activeTab == 2) Color(0xFF00E5FF) else Color.Gray) }
+                )
+                NavigationBarItem(
+                    selected = viewModel.activeTab == 3,
+                    onClick = { viewModel.activeTab = 3 },
+                    icon = { Icon(Icons.Default.Info, null, tint = if (viewModel.activeTab == 3) Color(0xFF00E5FF) else Color.Gray) },
+                    label = { Text("Özet", color = if (viewModel.activeTab == 3) Color(0xFF00E5FF) else Color.Gray) }
+                )
             }
         }
     ) { padding ->
-        Box(modifier = Modifier.padding(padding)) {
+        Box(modifier = Modifier.padding(padding).background(Color(0xFF121212))) {
             when (viewModel.activeTab) {
                 0 -> ActiveUsersTab(viewModel)
                 1 -> ChatTab(viewModel)
@@ -566,42 +700,43 @@ fun ActiveUsersTab(viewModel: FamilyViewModel) {
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         item {
-            Text("Aile Üyeleri (${members.size} Kişi)", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-            Spacer(modifier = Modifier.height(12.dp))
+            Text("Aile Üyeleri (${members.size} Kişi)", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.White)
+            Spacer(modifier = Modifier.height(14.dp))
         }
         items(members) { member ->
-            val isOnline = (currentTime - member.lastSeen) < 25_000
-            val timeAgoStr = if (isOnline) "Şu an Çevrimiçi" else {
+            val isOnline = (currentTime - member.lastSeen) < 30_000
+            val timeAgoStr = if (isOnline) "Şu an Çevrimiçi 🟢" else {
                 val diffMins = (currentTime - member.lastSeen) / (1000 * 60)
                 if (diffMins < 60) "$diffMins dk önce" else "${diffMins / 60} saat önce"
             }
 
             Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = if (member.isSos) Color(0xFFFFEBEE) else MaterialTheme.colorScheme.surfaceVariant
+                    containerColor = if (member.isSos) Color(0xFF3E1214) else Color(0xFF1E1E1E)
                 ),
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(14.dp)
             ) {
                 Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
-                            .size(14.dp)
+                            .size(16.dp)
                             .clip(CircleShape)
-                            .background(if (member.isSos) Color.Red else if (isOnline) Color(0xFF4CAF50) else Color.LightGray)
+                            .background(if (member.isSos) Color(0xFFFF5252) else if (isOnline) Color(0xFF00E676) else Color.Gray)
                     )
-                    Spacer(modifier = Modifier.width(12.dp))
+                    Spacer(modifier = Modifier.width(14.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(member.nickname, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Text(member.nickname, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White)
                             if (member.isSos) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("🚨 SOS", color = Color.Red, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("🚨 ACİL DURUM", color = Color(0xFFFF5252), fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             }
                         }
-                        Text(timeAgoStr, fontSize = 12.sp, color = if (isOnline) Color(0xFF2E7D32) else Color.Gray)
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(timeAgoStr, fontSize = 13.sp, color = if (isOnline) Color(0xFF00E676) else Color.LightGray)
                     }
-                    Text("🔋 %${member.battery}", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    Text("🔋 %${member.battery}", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
                 }
             }
         }
@@ -620,10 +755,10 @@ fun ChatTab(viewModel: FamilyViewModel) {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212))) {
         if (messages.isEmpty()) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("Henüz mesaj yok. İlk mesajı siz yazın! 👋", color = Color.Gray)
+                Text("Henüz mesaj yok. İlk mesajı siz yazın! 👋", color = Color.Gray, fontSize = 16.sp)
             }
         } else {
             LazyColumn(
@@ -642,28 +777,32 @@ fun ChatTab(viewModel: FamilyViewModel) {
                         Card(
                             shape = RoundedCornerShape(16.dp),
                             colors = CardDefaults.cardColors(
-                                containerColor = if (msg.type == "SOS") Color(0xFFFFCDD2)
-                                else if (isMe) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surfaceVariant
+                                containerColor = if (msg.type == "SOS") Color(0xFFD32F2F)
+                                else if (isMe) Color(0xFF005B64)
+                                else Color(0xFF262626)
                             )
                         ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
+                            Column(modifier = Modifier.padding(12.dp)) {
                                 if (!isMe) {
-                                    Text(msg.senderNickname, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                    Text(msg.senderNickname, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF00E5FF))
+                                    Spacer(modifier = Modifier.height(2.dp))
                                 }
                                 when (msg.type) {
-                                    "TEXT" -> Text(msg.text, fontSize = 15.sp)
-                                    "SOS" -> Text(msg.text, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.Red)
+                                    "TEXT" -> Text(msg.text, fontSize = 15.sp, color = Color.White)
+                                    "SOS" -> Text(msg.text, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White)
                                     "AUDIO" -> Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Default.PlayArrow, null)
-                                        Text("🎤 Sesli Mesaj", fontSize = 14.sp)
+                                        Icon(Icons.Default.PlayArrow, null, tint = Color.White)
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("🎤 Sesli Mesaj (0:12)", fontSize = 14.sp, color = Color.White, fontWeight = FontWeight.Medium)
                                     }
                                     "FILE" -> Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Default.Share, null)
-                                        Text("📎 Belge / Dosya", fontSize = 14.sp)
+                                        Icon(Icons.Default.Share, null, tint = Color.White)
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("📎 Belge Paylaşıldı", fontSize = 14.sp, color = Color.White)
                                     }
                                 }
-                                Text(timeStr, fontSize = 10.sp, color = Color.Gray, modifier = Modifier.align(Alignment.End))
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(timeStr, fontSize = 10.sp, color = Color.LightGray, modifier = Modifier.align(Alignment.End))
                             }
                         }
                     }
@@ -671,16 +810,35 @@ fun ChatTab(viewModel: FamilyViewModel) {
             }
         }
 
-        Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { viewModel.sendMessage("", "AUDIO") }) { Icon(Icons.Default.PlayArrow, null) }
-            IconButton(onClick = { viewModel.sendMessage("", "FILE") }) { Icon(Icons.Default.Share, null) }
+        // Mesaj Giriş Barı
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF1E1E1E))
+                .padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { viewModel.sendMessage("", "AUDIO") }) {
+                Icon(Icons.Default.PlayArrow, null, tint = Color(0xFF00E5FF))
+            }
+            IconButton(onClick = { viewModel.sendMessage("", "FILE") }) {
+                Icon(Icons.Default.Share, null, tint = Color(0xFF00E5FF))
+            }
             OutlinedTextField(
                 value = inputText,
                 onValueChange = { inputText = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Mesaj yazın...") },
+                placeholder = { Text("Mesaj yazın...", color = Color.Gray) },
                 shape = RoundedCornerShape(24.dp),
-                maxLines = 3
+                maxLines = 3,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    focusedBorderColor = Color(0xFF00E5FF),
+                    unfocusedBorderColor = Color(0xFF333333),
+                    focusedContainerColor = Color(0xFF2A2A2A),
+                    unfocusedContainerColor = Color(0xFF2A2A2A)
+                )
             )
             Spacer(modifier = Modifier.width(4.dp))
             IconButton(onClick = {
@@ -689,7 +847,7 @@ fun ChatTab(viewModel: FamilyViewModel) {
                     inputText = ""
                 }
             }) {
-                Icon(Icons.Default.Send, null, tint = MaterialTheme.colorScheme.primary)
+                Icon(Icons.Default.Send, null, tint = Color(0xFF00E5FF))
             }
         }
     }
@@ -711,12 +869,13 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
     val members = viewModel.membersList
     val context = LocalContext.current
 
+    // Koyu Tema Destekli Leaflet Harita
     val htmlMap = remember(members.size, viewModel.myLatitude, viewModel.myLongitude) {
         val sb = StringBuilder()
         sb.append("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>")
         sb.append("<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>")
         sb.append("<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>")
-        sb.append("<style>body{margin:0;padding:0;}#map{height:100vh;width:100vw;}</style></head><body>")
+        sb.append("<style>body{margin:0;padding:0;background:#121212;}#map{height:100vh;width:100vw;}</style></head><body>")
         sb.append("<div id='map'></div><script>")
         sb.append("var map = L.map('map').setView([" + viewModel.myLatitude + ", " + viewModel.myLongitude + "], 14);")
         sb.append("L.tileLayer('https://tile.openstreetmap.org/' + '{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);")
@@ -727,7 +886,7 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
         sb.toString()
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212))) {
         Box(modifier = Modifier.weight(1.2f).fillMaxWidth()) {
             AndroidView(
                 factory = { ctx ->
@@ -746,11 +905,12 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
 
         Card(
             modifier = Modifier.weight(0.8f).fillMaxWidth(),
-            shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
+            shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E))
         ) {
-            LazyColumn(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+            LazyColumn(modifier = Modifier.fillMaxSize().padding(14.dp)) {
                 item {
-                    Text("Aile Konumları & Navigasyon", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Text("Canlı Aile Radarı", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
                     Spacer(modifier = Modifier.height(8.dp))
                 }
                 items(members) { m ->
@@ -758,14 +918,14 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
                     val distStr = if (m.id == viewModel.userId) "Siz (Buradasınız)" else String.format(Locale.US, "%.1f km uzakta", distKm)
 
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.LocationOn, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Icon(Icons.Default.LocationOn, contentDescription = null, tint = Color(0xFF00E5FF))
+                        Spacer(modifier = Modifier.width(10.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(m.nickname, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                            Text(distStr, fontSize = 12.sp, color = Color.Gray)
+                            Text(m.nickname, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
+                            Text(distStr, fontSize = 13.sp, color = Color.LightGray)
                         }
 
                         Button(
@@ -780,13 +940,14 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
                                     context.startActivity(webIntent)
                                 }
                             },
-                            shape = RoundedCornerShape(8.dp),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
-                            Text("Google Harita", fontSize = 11.sp)
+                            Text("Haritada Gör", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
-                    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color.LightGray.copy(alpha = 0.4f)))
+                    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF333333)))
                 }
             }
         }
@@ -802,32 +963,45 @@ fun WeeklySummaryTab(viewModel: FamilyViewModel) {
     val lastMsg = messages.lastOrNull()
     val mediaCount = lastWeekMessages.count { it.type != "TEXT" }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Gerçek Aile Güvenlik & Etkileşim Raporu", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Text("Aile Güvenlik & İletişim Raporu", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
         Spacer(modifier = Modifier.height(16.dp))
 
-        Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(12.dp)) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF004D40)),
+            shape = RoundedCornerShape(14.dp)
+        ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Son Mesaj Gönderen:", fontSize = 12.sp, color = Color.DarkGray)
+                Text("Son Mesaj Gönderen:", fontSize = 13.sp, color = Color(0xFF80CBC4), fontWeight = FontWeight.SemiBold)
                 val timeFormat = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault())
                 val timeStr = if (lastMsg != null) timeFormat.format(Date(lastMsg.timestamp)) else "-"
-                Text(text = "${lastMsg?.senderNickname ?: "Henüz mesaj yok"} ($timeStr)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(text = "${lastMsg?.senderNickname ?: "Henüz mesaj yok"} ($timeStr)", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White)
                 if (lastMsg != null) {
-                    Text(text = "\"${lastMsg.text.ifBlank { "[Medya/Ses]" }}\"", fontSize = 14.sp, color = Color.DarkGray)
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(text = "\"${lastMsg.text.ifBlank { "[Medya/Ses]" }}\"", fontSize = 14.sp, color = Color(0xFFE0F2F1))
                 }
             }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E))
+        ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Son 7 Günlük Güvenlik ve İstatistik", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("• Bu Hafta Atılan Mesaj: ${lastWeekMessages.size} adet")
-                Text("• Paylaşılan Medya: $mediaCount adet")
-                Text("• Canlı GPS Takipteki Üyeler: ${viewModel.membersList.size} kişi")
-                Text("• GPS ve Canlı Harita: Aktif & Senkronize 🟢")
+                Text("Haftalık Güvenlik Özeti", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White)
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("• Toplam Atılan Mesaj: ${lastWeekMessages.size} adet", color = Color.LightGray, fontSize = 14.sp)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text("• Paylaşılan Medya & Ses: $mediaCount adet", color = Color.LightGray, fontSize = 14.sp)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text("• Radardaki Aile Üyeleri: ${viewModel.membersList.size} kişi", color = Color.LightGray, fontSize = 14.sp)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text("• Canlı GPS & Şarj Takibi: Aktif 🟢", color = Color(0xFF00E676), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -838,18 +1012,18 @@ fun CallOverlay(onEndCall: () -> Unit) {
     var isMicMuted by remember { mutableStateOf(false) }
     var isVideoOn by remember { mutableStateOf(true) }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color(0xE6101010)), contentAlignment = Alignment.Center) {
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xF2101010)), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
             Icon(imageVector = Icons.Default.Person, contentDescription = null, modifier = Modifier.size(100.dp), tint = Color.White)
             Spacer(modifier = Modifier.height(16.dp))
-            Text("Aile Görüşmesi Sürüyor", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text("Ses ve Görüntü Aktif", color = Color.LightGray)
+            Text("Aile Görüşmesi Sürüyor", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text("Ses ve Görüntü Aktif 🟢", color = Color(0xFF00E5FF))
             Spacer(modifier = Modifier.height(48.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                IconButton(onClick = { isMicMuted = !isMicMuted }, modifier = Modifier.background(if (isMicMuted) Color.Red else Color.DarkGray, CircleShape)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                IconButton(onClick = { isMicMuted = !isMicMuted }, modifier = Modifier.background(if (isMicMuted) Color.Red else Color(0xFF333333), CircleShape)) {
                     Icon(Icons.Default.Phone, null, tint = Color.White)
                 }
-                IconButton(onClick = { isVideoOn = !isVideoOn }, modifier = Modifier.background(if (!isVideoOn) Color.Red else Color.DarkGray, CircleShape)) {
+                IconButton(onClick = { isVideoOn = !isVideoOn }, modifier = Modifier.background(if (!isVideoOn) Color.Red else Color(0xFF333333), CircleShape)) {
                     Icon(Icons.Default.Share, null, tint = Color.White)
                 }
                 IconButton(onClick = onEndCall, modifier = Modifier.background(Color.Red, CircleShape)) {
