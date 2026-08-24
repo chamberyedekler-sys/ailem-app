@@ -72,7 +72,8 @@ data class MemberDto(
     val longitude: Double = 28.9784,
     val battery: Int = 100,
     val isSos: Boolean = false,
-    val ipAddress: String = ""
+    val ipAddress: String = "",
+    val networkType: String = "Wi-Fi" // Wi-Fi veya Mobil Veri
 )
 
 data class MessageDto(
@@ -86,156 +87,23 @@ data class MessageDto(
     val timestamp: Long = 0L
 )
 
-data class CloudPacket(
+data class NetworkPacket(
     val eventType: String = "", // "MEMBER_UPDATE", "CHAT_MESSAGE", "CALL_SIGNAL"
     val member: MemberDto? = null,
-    val message: MessageDto? = null,
-    val callTargetIp: String? = null
+    val message: MessageDto? = null
 )
 
 // ==========================================
-// 2. GERÇEK VOIP SESLİ GÖRÜŞME MOTORU (PCM STREAM)
+// 2. AKILLI WI-FI OTOMATİK TARAYICI & UDP MOTORU
 // ==========================================
 
-object RealVoipEngine {
-    private const val SAMPLE_RATE = 16000
-    private const val CHANNEL_IN = AudioFormat.CHANNEL_IN_MONO
-    private const val CHANNEL_OUT = AudioFormat.CHANNEL_OUT_MONO
-    private const val FORMAT = AudioFormat.ENCODING_PCM_16BIT
-    private const val VOIP_PORT = 8890
-
-    private var isCalling = false
-    private var sendJob: Job? = null
-    private var receiveJob: Job? = null
-    private var datagramSocket: DatagramSocket? = null
-
-    @SuppressLint("MissingPermission")
-    fun startCall(targetIp: String) {
-        if (isCalling) return
-        isCalling = true
-
-        try {
-            datagramSocket = DatagramSocket(VOIP_PORT)
-        } catch (_: Exception) {}
-
-        // Ses Gönderme Thread'i
-        sendJob = CoroutineScope(Dispatchers.IO).launch {
-            val minBufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, FORMAT)
-            val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, CHANNEL_IN, FORMAT, minBufSize)
-            val buffer = ByteArray(minBufSize)
-            val address = try { InetAddress.getByName(targetIp) } catch (_: Exception) { null }
-
-            if (address != null) {
-                audioRecord.startRecording()
-                while (isActive && isCalling) {
-                    val read = audioRecord.read(buffer, 0, buffer.size)
-                    if (read > 0) {
-                        try {
-                            val packet = DatagramPacket(buffer, read, address, VOIP_PORT)
-                            datagramSocket?.send(packet)
-                        } catch (_: Exception) {}
-                    }
-                }
-                audioRecord.stop()
-                audioRecord.release()
-            }
-        }
-
-        // Ses Alma & Çalma Thread'i
-        receiveJob = CoroutineScope(Dispatchers.IO).launch {
-            val minBufSize = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_OUT, FORMAT)
-            val audioTrack = AudioTrack(
-                AudioManager.STREAM_VOICE_CALL, SAMPLE_RATE, CHANNEL_OUT, FORMAT, minBufSize, AudioTrack.MODE_STREAM
-            )
-            audioTrack.play()
-            val receiveBuffer = ByteArray(minBufSize)
-
-            while (isActive && isCalling) {
-                try {
-                    val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
-                    datagramSocket?.receive(packet)
-                    audioTrack.write(packet.data, 0, packet.length)
-                } catch (_: Exception) {}
-            }
-            audioTrack.stop()
-            audioTrack.release()
-        }
-    }
-
-    fun endCall() {
-        isCalling = false
-        sendJob?.cancel()
-        receiveJob?.cancel()
-        datagramSocket?.close()
-        datagramSocket = null
-    }
-}
-
-// ==========================================
-// 3. GERÇEK SES KAYDI & OYNATMA MOTORU
-// ==========================================
-
-object RealAudioRecorder {
-    private var recorder: MediaRecorder? = null
-    private var tempFile: File? = null
-
-    fun startRecording(context: Context): Boolean {
-        return try {
-            tempFile = File(context.cacheDir, "record_${System.currentTimeMillis()}.m4a")
-            recorder = MediaRecorder().apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setOutputFile(tempFile?.absolutePath)
-                prepare()
-                start()
-            }
-            true
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    fun stopAndGetBase64(): String? {
-        return try {
-            recorder?.stop()
-            recorder?.release()
-            recorder = null
-            tempFile?.let { file ->
-                if (file.exists()) {
-                    val bytes = file.readBytes()
-                    Base64.encodeToString(bytes, Base64.NO_WRAP)
-                } else null
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    fun playBase64Audio(context: Context, base64Str: String) {
-        try {
-            val bytes = Base64.decode(base64Str, Base64.NO_WRAP)
-            val tempPlay = File(context.cacheDir, "play_temp.m4a")
-            tempPlay.writeBytes(bytes)
-
-            val mp = MediaPlayer()
-            mp.setDataSource(tempPlay.absolutePath)
-            mp.prepare()
-            mp.start()
-        } catch (_: Exception) {}
-    }
-}
-
-// ==========================================
-// 4. BULUT & YEREL AĞ (LAN P2P) MOTORU
-// ==========================================
-
-object NetworkEngine {
-    private val client = OkHttpClient.Builder().connectTimeout(4, TimeUnit.SECONDS).build()
+object SmartNetworkDiscovery {
+    private const val UDP_PORT = 8888
     private val gson = Gson()
-    private val mediaType = "text/plain; charset=utf-8".toMediaType()
+    private var isListening = false
 
-    fun getLocalIp(): String {
+    // Kendi yerel IP adresimizi bul
+    fun getLocalIpAddress(): String {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
@@ -249,26 +117,73 @@ object NetworkEngine {
                 }
             }
         } catch (_: Exception) {}
-        return ""
+        return "127.0.0.1"
     }
 
-    // Bulut Üzerinden Aktar
-    suspend fun publishCloud(code: String, packet: CloudPacket) = withContext(Dispatchers.IO) {
+    // UDP ile Yerel Ağa Yayın Yap (Aynı Wi-Fi'dakileri Anında Bulur)
+    fun broadcastToLocalNetwork(packet: NetworkPacket) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val socket = DatagramSocket()
+                socket.broadcast = true
+                val jsonBytes = gson.toJson(packet).toByteArray(Charsets.UTF_8)
+                val broadcastAddr = InetAddress.getByName("255.255.255.255")
+                val datagram = DatagramPacket(jsonBytes, jsonBytes.size, broadcastAddr, UDP_PORT)
+                socket.send(datagram)
+                socket.close()
+            } catch (_: Exception) {}
+        }
+    }
+
+    // Yerel Ağdan Gelen Yayınları Sürekli Dinle
+    fun startLocalListener(onPacketReceived: (NetworkPacket) -> Unit) {
+        if (isListening) return
+        isListening = true
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val socket = DatagramSocket(UDP_PORT)
+                val buffer = ByteArray(4096)
+                while (isActive && isListening) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    val jsonStr = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                    try {
+                        val netPacket = gson.fromJson(jsonStr, NetworkPacket::class.java)
+                        withContext(Dispatchers.Main) {
+                            onPacketReceived(netPacket)
+                        }
+                    } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
+    }
+}
+
+// ==========================================
+// 3. KÜRESEL AĞ SENKRONİZASYON MOTORU (FALLBACK)
+// ==========================================
+
+object GlobalRelayEngine {
+    private val client = OkHttpClient.Builder().connectTimeout(4, TimeUnit.SECONDS).build()
+    private val gson = Gson()
+    private val mediaType = "text/plain; charset=utf-8".toMediaType()
+
+    suspend fun publish(familyCode: String, packet: NetworkPacket) = withContext(Dispatchers.IO) {
         try {
-            val clean = code.replace("#", "").lowercase().trim()
-            val url = "https://ntfy.sh/ailem_room_$clean"
+            val clean = familyCode.replace("#", "").lowercase().trim()
+            val url = "https://ntfy.sh/ailem_net_$clean"
             val json = gson.toJson(packet)
             val req = Request.Builder().url(url).post(json.toRequestBody(mediaType)).build()
             client.newCall(req).execute().close()
         } catch (_: Exception) {}
     }
 
-    // Buluttan Dinle
-    suspend fun pollCloud(code: String, sinceSec: Long): List<CloudPacket> = withContext(Dispatchers.IO) {
-        val list = mutableListOf<CloudPacket>()
+    suspend fun poll(familyCode: String, sinceSec: Long): List<NetworkPacket> = withContext(Dispatchers.IO) {
+        val list = mutableListOf<NetworkPacket>()
         try {
-            val clean = code.replace("#", "").lowercase().trim()
-            val url = "https://ntfy.sh/ailem_room_$clean/json?since=$sinceSec"
+            val clean = familyCode.replace("#", "").lowercase().trim()
+            val url = "https://ntfy.sh/ailem_net_$clean/json?since=$sinceSec"
             val req = Request.Builder().url(url).get().build()
             client.newCall(req).execute().use { res ->
                 val body = res.body?.string() ?: ""
@@ -277,8 +192,8 @@ object NetworkEngine {
                         try {
                             val map = gson.fromJson(line, Map::class.java)
                             if (map["event"] == "message") {
-                                val msgPayload = map["message"]?.toString() ?: ""
-                                val packet = gson.fromJson(msgPayload, CloudPacket::class.java)
+                                val payload = map["message"]?.toString() ?: ""
+                                val packet = gson.fromJson(payload, NetworkPacket::class.java)
                                 list.add(packet)
                             }
                         } catch (_: Exception) {}
@@ -287,6 +202,115 @@ object NetworkEngine {
             }
         } catch (_: Exception) {}
         list
+    }
+}
+
+// ==========================================
+// 4. GERÇEK VOIP SESLİ GÖRÜŞME & SES KAYIT MOTORU
+// ==========================================
+
+object HardwareMediaEngine {
+    private const val VOIP_PORT = 8890
+    private var isCalling = false
+    private var sendJob: Job? = null
+    private var receiveJob: Job? = null
+    private var datagramSocket: DatagramSocket? = null
+
+    // Gerçek VoIP Telsiz Ses Akışı
+    @SuppressLint("MissingPermission")
+    fun startCall(targetIp: String) {
+        if (isCalling) return
+        isCalling = true
+
+        try { datagramSocket = DatagramSocket(VOIP_PORT) } catch (_: Exception) {}
+
+        sendJob = CoroutineScope(Dispatchers.IO).launch {
+            val minBuf = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val recorder = AudioRecord(MediaRecorder.AudioSource.MIC, 16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf)
+            val buffer = ByteArray(minBuf)
+            val address = try { InetAddress.getByName(targetIp) } catch (_: Exception) { null }
+
+            if (address != null) {
+                recorder.startRecording()
+                while (isActive && isCalling) {
+                    val read = recorder.read(buffer, 0, buffer.size)
+                    if (read > 0) {
+                        try {
+                            val packet = DatagramPacket(buffer, read, address, VOIP_PORT)
+                            datagramSocket?.send(packet)
+                        } catch (_: Exception) {}
+                    }
+                }
+                recorder.stop()
+                recorder.release()
+            }
+        }
+
+        receiveJob = CoroutineScope(Dispatchers.IO).launch {
+            val minBuf = AudioTrack.getMinBufferSize(16000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val track = AudioTrack(AudioManager.STREAM_VOICE_CALL, 16000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf, AudioTrack.MODE_STREAM)
+            track.play()
+            val buf = ByteArray(minBuf)
+
+            while (isActive && isCalling) {
+                try {
+                    val packet = DatagramPacket(buf, buf.size)
+                    datagramSocket?.receive(packet)
+                    track.write(packet.data, 0, packet.length)
+                } catch (_: Exception) {}
+            }
+            track.stop()
+            track.release()
+        }
+    }
+
+    fun endCall() {
+        isCalling = false
+        sendJob?.cancel()
+        receiveJob?.cancel()
+        datagramSocket?.close()
+        datagramSocket = null
+    }
+
+    // Mikrofon Ses Kaydı
+    private var mediaRecorder: MediaRecorder? = null
+    private var tempAudioFile: File? = null
+
+    fun startVoiceRecord(context: Context): Boolean {
+        return try {
+            tempAudioFile = File(context.cacheDir, "voice_${System.currentTimeMillis()}.m4a")
+            mediaRecorder = MediaRecorder().apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setOutputFile(tempAudioFile?.absolutePath)
+                prepare()
+                start()
+            }
+            true
+        } catch (_: Exception) { false }
+    }
+
+    fun stopVoiceRecordAndGetBase64(): String? {
+        return try {
+            mediaRecorder?.stop()
+            mediaRecorder?.release()
+            mediaRecorder = null
+            tempAudioFile?.let { if (it.exists()) Base64.encodeToString(it.readBytes(), Base64.NO_WRAP) else null }
+        } catch (_: Exception) { null }
+    }
+
+    fun playBase64Audio(context: Context, base64: String) {
+        try {
+            val bytes = Base64.decode(base64, Base64.NO_WRAP)
+            val temp = File(context.cacheDir, "play_temp.m4a")
+            temp.writeBytes(bytes)
+            MediaPlayer().apply {
+                setDataSource(temp.absolutePath)
+                prepare()
+                start()
+            }
+        } catch (_: Exception) {}
     }
 }
 
@@ -304,15 +328,18 @@ class FamilyViewModel : ViewModel() {
     var myLongitude by mutableStateOf(28.9784)
     var myBattery by mutableStateOf(100)
     var isSosActive by mutableStateOf(false)
-    var myLocalIp by mutableStateOf("")
+    var myLocalIp by mutableStateOf("127.0.0.1")
 
     var membersList = mutableStateListOf<MemberDto>()
     var messagesList = mutableStateListOf<MessageDto>()
     private val messageIds = mutableSetOf<String>()
 
-    var activeTab by mutableStateOf(1)
+    var activeTab by mutableStateOf(1) // 0: Aktifler, 1: Sohbet, 2: Harita, 3: Özet
     var isRecordingAudio by mutableStateOf(false)
     var isInCall by mutableStateOf(false)
+    var focusedMapLatitude by mutableStateOf(41.0082)
+    var focusedMapLongitude by mutableStateOf(28.9784)
+
     private var lastPollTime = (System.currentTimeMillis() / 1000L) - 30
 
     fun init(context: Context) {
@@ -320,11 +347,16 @@ class FamilyViewModel : ViewModel() {
         currentUserNickname = prefs.getString("nick", "") ?: ""
         currentFamilyCode = prefs.getString("code", "") ?: ""
         currentFamilyName = prefs.getString("name", "Ailem") ?: "Ailem"
-        myLocalIp = NetworkEngine.getLocalIp()
+        myLocalIp = SmartNetworkDiscovery.getLocalIpAddress()
+
+        // UDP Dinleyicisini Başlat
+        SmartNetworkDiscovery.startLocalListener { packet ->
+            handleIncomingPacket(packet)
+        }
 
         if (currentFamilyCode.isNotBlank()) {
             ensureSelf()
-            startSyncLoop()
+            startPeriodicSync()
         }
         updateBattery(context)
     }
@@ -356,7 +388,7 @@ class FamilyViewModel : ViewModel() {
 
         ensureSelf()
         sendMessage("🌟 $name aile grubu kuruldu! Katılma Kodu: $code")
-        startSyncLoop()
+        startPeriodicSync()
     }
 
     fun joinFamily(context: Context, code: String) {
@@ -367,11 +399,11 @@ class FamilyViewModel : ViewModel() {
             .putString("code", clean).putString("name", "Aile Grubu").apply()
 
         ensureSelf()
-        startSyncLoop()
+        startPeriodicSync()
     }
 
     private fun ensureSelf() {
-        val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive, myLocalIp)
+        val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive, myLocalIp, if (myLocalIp.startsWith("192.168") || myLocalIp.startsWith("10.")) "Wi-Fi" else "Mobil Veri")
         val idx = membersList.indexOfFirst { it.id == userId }
         if (idx >= 0) membersList[idx] = me else membersList.add(0, me)
     }
@@ -394,20 +426,20 @@ class FamilyViewModel : ViewModel() {
             timestamp = System.currentTimeMillis()
         )
         addMessageSafely(newMsg)
-        viewModelScope.launch {
-            NetworkEngine.publishCloud(currentFamilyCode, CloudPacket("CHAT_MESSAGE", message = newMsg))
+
+        val packet = NetworkPacket("CHAT_MESSAGE", message = newMsg)
+        SmartNetworkDiscovery.broadcastToLocalNetwork(packet) // Yerel Wi-Fi
+        viewModelScope.launch { GlobalRelayEngine.publish(currentFamilyCode, packet) } // Bulut
+    }
+
+    fun handleIncomingPacket(packet: NetworkPacket) {
+        if (packet.eventType == "MEMBER_UPDATE" && packet.member != null) {
+            val inc = packet.member
+            val idx = membersList.indexOfFirst { it.id == inc.id }
+            if (idx >= 0) membersList[idx] = inc else membersList.add(inc)
+        } else if (packet.eventType == "CHAT_MESSAGE" && packet.message != null) {
+            addMessageSafely(packet.message)
         }
-    }
-
-    fun startRealVoipCall(targetMember: MemberDto) {
-        isInCall = true
-        val targetIp = targetMember.ipAddress.ifBlank { "255.255.255.255" }
-        RealVoipEngine.startCall(targetIp)
-    }
-
-    fun endRealVoipCall() {
-        isInCall = false
-        RealVoipEngine.endCall()
     }
 
     private fun addMessageSafely(msg: MessageDto) {
@@ -416,25 +448,31 @@ class FamilyViewModel : ViewModel() {
         }
     }
 
-    private fun startSyncLoop() {
+    fun startVoipCall(member: MemberDto) {
+        isInCall = true
+        val targetIp = if (member.ipAddress.isNotBlank() && member.ipAddress != "127.0.0.1") member.ipAddress else "255.255.255.255"
+        HardwareMediaEngine.startCall(targetIp)
+    }
+
+    fun endVoipCall() {
+        isInCall = false
+        HardwareMediaEngine.endCall()
+    }
+
+    private fun startPeriodicSync() {
         viewModelScope.launch {
             while (isActive && currentFamilyCode.isNotBlank()) {
-                myLocalIp = NetworkEngine.getLocalIp()
-                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive, myLocalIp)
+                myLocalIp = SmartNetworkDiscovery.getLocalIpAddress()
+                val me = MemberDto(userId, currentUserNickname, System.currentTimeMillis(), myLatitude, myLongitude, myBattery, isSosActive, myLocalIp, if (myLocalIp.startsWith("192.168") || myLocalIp.startsWith("10.")) "Wi-Fi" else "Mobil Veri")
                 ensureSelf()
-                NetworkEngine.publishCloud(currentFamilyCode, CloudPacket("MEMBER_UPDATE", member = me))
 
-                val events = NetworkEngine.pollCloud(currentFamilyCode, lastPollTime)
-                if (events.isNotEmpty()) {
-                    events.forEach { packet ->
-                        if (packet.eventType == "MEMBER_UPDATE" && packet.member != null) {
-                            val inc = packet.member
-                            val idx = membersList.indexOfFirst { it.id == inc.id }
-                            if (idx >= 0) membersList[idx] = inc else membersList.add(inc)
-                        } else if (packet.eventType == "CHAT_MESSAGE" && packet.message != null) {
-                            addMessageSafely(packet.message)
-                        }
-                    }
+                val updatePacket = NetworkPacket("MEMBER_UPDATE", member = me)
+                SmartNetworkDiscovery.broadcastToLocalNetwork(updatePacket) // Wi-Fi broadcast
+                GlobalRelayEngine.publish(currentFamilyCode, updatePacket) // Bulut senkron
+
+                val cloudEvents = GlobalRelayEngine.poll(currentFamilyCode, lastPollTime)
+                if (cloudEvents.isNotEmpty()) {
+                    cloudEvents.forEach { handleIncomingPacket(it) }
                     lastPollTime = (System.currentTimeMillis() / 1000L) - 4
                 }
                 delay(2500)
@@ -444,7 +482,7 @@ class FamilyViewModel : ViewModel() {
 }
 
 // ==========================================
-// 6. MAIN ACTIVITY
+// 6. MAIN ACTIVITY & DARK THEME
 // ==========================================
 
 class MainActivity : ComponentActivity(), LocationListener {
@@ -515,8 +553,8 @@ class MainActivity : ComponentActivity(), LocationListener {
                 vm?.myLatitude = it.latitude
                 vm?.myLongitude = it.longitude
             }
-            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 4000L, 4f, this)
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 4000L, 4f, this)
+            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 3000L, 3f, this)
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 3000L, 3f, this)
         } catch (_: Exception) {}
     }
 
@@ -541,6 +579,8 @@ fun NicknameScreen(onContinue: (String) -> Unit) {
         Icon(Icons.Default.Person, null, modifier = Modifier.size(90.dp), tint = Color(0xFF00E5FF))
         Spacer(modifier = Modifier.height(16.dp))
         Text("Ailem Canlı İletişim", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Spacer(modifier = Modifier.height(8.dp))
+        Text("Wi-Fi & Bulut Ağında Tanınacağınız İsim", color = Color.LightGray, fontSize = 14.sp)
         Spacer(modifier = Modifier.height(28.dp))
         OutlinedTextField(
             value = name,
@@ -705,11 +745,11 @@ fun MainAppContainer(viewModel: FamilyViewModel) {
             when (viewModel.activeTab) {
                 0 -> ActiveUsersTab(viewModel)
                 1 -> ChatTab(viewModel)
-                2 -> LiveMapTab(viewModel)
+                2 -> EmbeddedLiveMapTab(viewModel)
                 3 -> WeeklySummaryTab(viewModel)
             }
             if (viewModel.isInCall) {
-                CallOverlay(onEndCall = { viewModel.endRealVoipCall() })
+                CallOverlay(onEndCall = { viewModel.endVoipCall() })
             }
         }
     }
@@ -722,12 +762,12 @@ fun ActiveUsersTab(viewModel: FamilyViewModel) {
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         item {
-            Text("Canlı Aile Üyeleri (${members.size} Kişi)", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.White)
+            Text("Canlı Ağdaki Cihazlar (${members.size} Kişi)", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.White)
             Spacer(modifier = Modifier.height(14.dp))
         }
         items(members) { m ->
             val isOnline = (currentTime - m.lastSeen) < 30_000
-            val timeAgoStr = if (isOnline) "Canlı Çevrimiçi 🟢" else "${(currentTime - m.lastSeen)/60000} dk önce"
+            val timeAgoStr = if (isOnline) "🟢 Canlı (${m.networkType})" else "${(currentTime - m.lastSeen)/60000} dk önce"
 
             Card(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
@@ -739,12 +779,13 @@ fun ActiveUsersTab(viewModel: FamilyViewModel) {
                     Spacer(modifier = Modifier.width(14.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(m.nickname, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White)
-                        Text(timeAgoStr, fontSize = 13.sp, color = if (isOnline) Color(0xFF00E676) else Color.LightGray)
+                        Text(timeAgoStr, fontSize = 12.sp, color = if (isOnline) Color(0xFF00E676) else Color.LightGray)
+                        Text("IP: ${m.ipAddress}", fontSize = 11.sp, color = Color.Gray)
                     }
                     Text("🔋 %${m.battery}", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Spacer(modifier = Modifier.width(8.dp))
                     if (m.id != viewModel.userId && isOnline) {
-                        IconButton(onClick = { viewModel.startRealVoipCall(m) }) {
+                        IconButton(onClick = { viewModel.startVoipCall(m) }) {
                             Icon(Icons.Default.Phone, null, tint = Color(0xFF00E5FF))
                         }
                     }
@@ -761,7 +802,6 @@ fun ChatTab(viewModel: FamilyViewModel) {
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Gerçek Dosya ve Fotoğraf Seçici
     val fileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -771,7 +811,7 @@ fun ChatTab(viewModel: FamilyViewModel) {
                 val bytes = inputStream?.readBytes()
                 if (bytes != null) {
                     val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    viewModel.sendMessage("📎 Dosya Paylaşıldı", "FILE", base64, "belge_${System.currentTimeMillis()}.dat")
+                    viewModel.sendMessage("📎 Dosya Paylaşıldı", "FILE", base64, "ek_${System.currentTimeMillis()}.dat")
                 }
             } catch (_: Exception) {}
         }
@@ -797,7 +837,7 @@ fun ChatTab(viewModel: FamilyViewModel) {
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             if (!isMe) Text(msg.senderNickname, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF00E5FF))
-                            
+
                             when (msg.type) {
                                 "TEXT", "SOS" -> Text(msg.text, fontSize = 15.sp, color = Color.White)
                                 "AUDIO" -> {
@@ -805,7 +845,7 @@ fun ChatTab(viewModel: FamilyViewModel) {
                                         verticalAlignment = Alignment.CenterVertically,
                                         modifier = Modifier.clickable {
                                             if (msg.fileBase64.isNotBlank()) {
-                                                RealAudioRecorder.playBase64Audio(context, msg.fileBase64)
+                                                HardwareMediaEngine.playBase64Audio(context, msg.fileBase64)
                                             }
                                         }
                                     ) {
@@ -829,19 +869,18 @@ fun ChatTab(viewModel: FamilyViewModel) {
             }
         }
 
-        // Alt Giriş Barı (Gerçek Mikrofon & Gerçek Dosya Butonu)
+        // Alt Bar
         Row(
             modifier = Modifier.fillMaxWidth().background(Color(0xFF1E1E1E)).padding(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Gerçek Mikrofon Kaydı Butonu
             IconButton(
                 onClick = {
                     if (!viewModel.isRecordingAudio) {
-                        val started = RealAudioRecorder.startRecording(context)
+                        val started = HardwareMediaEngine.startVoiceRecord(context)
                         if (started) viewModel.isRecordingAudio = true
                     } else {
-                        val base64 = RealAudioRecorder.stopAndGetBase64()
+                        val base64 = HardwareMediaEngine.stopVoiceRecordAndGetBase64()
                         viewModel.isRecordingAudio = false
                         if (!base64.isNullOrBlank()) {
                             viewModel.sendMessage("🎤 Sesli Mesaj", "AUDIO", base64)
@@ -856,7 +895,6 @@ fun ChatTab(viewModel: FamilyViewModel) {
                 )
             }
 
-            // Gerçek Dosya Seçici Butonu
             IconButton(onClick = { fileLauncher.launch("*/*") }) {
                 Icon(Icons.Default.Share, null, tint = Color(0xFF00E5FF))
             }
@@ -865,7 +903,7 @@ fun ChatTab(viewModel: FamilyViewModel) {
                 value = inputText,
                 onValueChange = { inputText = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text(if (viewModel.isRecordingAudio) "🔴 Ses Kaydediliyor..." else "Mesaj yazın...", color = Color.Gray) },
+                placeholder = { Text(if (viewModel.isRecordingAudio) "🔴 Kaydediliyor..." else "Mesaj yazın...", color = Color.Gray) },
                 shape = RoundedCornerShape(24.dp),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = Color.White, unfocusedTextColor = Color.White,
@@ -895,28 +933,33 @@ fun calculateDistanceInKm(lat1: Double, lon1: Double, lat2: Double, lon2: Double
     return r * c
 }
 
-@Composable
-fun LiveMapTab(viewModel: FamilyViewModel) {
-    val members = viewModel.membersList
-    val context = LocalContext.current
+// ==========================================
+// 8. UYGULAMA İÇİ GÖMÜLÜ HARİTA (DIŞARI ATMAZ!)
+// ==========================================
 
-    val htmlMap = remember(members.size, viewModel.myLatitude, viewModel.myLongitude) {
+@Composable
+fun EmbeddedLiveMapTab(viewModel: FamilyViewModel) {
+    val members = viewModel.membersList
+
+    // Koyu Tema Gömülü İnteraktif Harita
+    val htmlMap = remember(members.size, viewModel.focusedMapLatitude, viewModel.focusedMapLongitude) {
         val sb = StringBuilder()
         sb.append("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>")
         sb.append("<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>")
         sb.append("<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>")
         sb.append("<style>body{margin:0;padding:0;background:#121212;}#map{height:100vh;width:100vw;}</style></head><body>")
         sb.append("<div id='map'></div><script>")
-        sb.append("var map = L.map('map').setView([" + viewModel.myLatitude + ", " + viewModel.myLongitude + "], 14);")
+        sb.append("var map = L.map('map').setView([" + viewModel.focusedMapLatitude + ", " + viewModel.focusedMapLongitude + "], 15);")
         sb.append("L.tileLayer('https://tile.openstreetmap.org/' + '{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);")
         for (m in members) {
-            sb.append("L.marker([" + m.latitude + ", " + m.longitude + "]).addTo(map).bindPopup('<b>" + m.nickname + "</b><br>Pil: %" + m.battery + "');")
+            sb.append("L.marker([" + m.latitude + ", " + m.longitude + "]).addTo(map).bindPopup('<b>" + m.nickname + "</b><br>Pil: %" + m.battery + "<br>IP: " + m.ipAddress + "').openPopup();")
         }
         sb.append("</script></body></html>")
         sb.toString()
     }
 
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212))) {
+        // Gömülü Harita Görünümü
         Box(modifier = Modifier.weight(1.2f).fillMaxWidth()) {
             AndroidView(
                 factory = { ctx ->
@@ -931,6 +974,7 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
             )
         }
 
+        // Harita Altı: Üye Listesi & Uygulama İçi Odaklan Butonu (Dışarıya Atmaz!)
         Card(
             modifier = Modifier.weight(0.8f).fillMaxWidth(),
             shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
@@ -938,7 +982,7 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
         ) {
             LazyColumn(modifier = Modifier.fillMaxSize().padding(14.dp)) {
                 item {
-                    Text("Canlı Aile Konum Radarı", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
+                    Text("Canlı Aile Radarı & Konumlar", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
                     Spacer(modifier = Modifier.height(8.dp))
                 }
                 items(members) { m ->
@@ -951,22 +995,19 @@ fun LiveMapTab(viewModel: FamilyViewModel) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(m.nickname, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
                             Text(distStr, fontSize = 13.sp, color = Color.LightGray)
+                            Text("Ağ: ${m.networkType} | IP: ${m.ipAddress}", fontSize = 11.sp, color = Color.Gray)
                         }
 
+                        // Uygulama İçinde Haritayı O Üyeye Odakla
                         Button(
                             onClick = {
-                                val gmmIntentUri = Uri.parse("google.navigation:q=" + m.latitude + "," + m.longitude)
-                                val mapIntent = Intent(Intent.ACTION_VIEW, gmmIntentUri).apply { setPackage("com.google.android.apps.maps") }
-                                try {
-                                    context.startActivity(mapIntent)
-                                } catch (e: Exception) {
-                                    val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/maps/dir/?api=1&destination=" + m.latitude + "," + m.longitude))
-                                    context.startActivity(webIntent)
-                                }
+                                viewModel.focusedMapLatitude = m.latitude
+                                viewModel.focusedMapLongitude = m.longitude
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black)
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black),
+                            shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text("Google Harita", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text("Haritada Odakla", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                     Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF333333)))
@@ -1013,22 +1054,21 @@ fun WeeklySummaryTab(viewModel: FamilyViewModel) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Text("• Toplam İletilen Mesaj: ${lastWeekMessages.size} adet", color = Color.LightGray)
                 Text("• İletilen Ses/Dosya: $mediaCount adet", color = Color.LightGray)
-                Text("• Canlı Ağdaki Üyeler: ${viewModel.membersList.size} kişi", color = Color.LightGray)
-                Text("• P2P / Bulut Mesh Senkron: AKTİF 🟢", color = Color(0xFF00E676), fontWeight = FontWeight.Bold)
+                Text("• Aktif Ağdaki Cihazlar: ${viewModel.membersList.size} kişi", color = Color.LightGray)
+                Text("• Wi-Fi Subnet & Bulut Köprüsü: AKTİF 🟢", color = Color(0xFF00E676), fontWeight = FontWeight.Bold)
             }
         }
     }
 }
 
-// Canlı VoIP Görüşme Modalı
 @Composable
 fun CallOverlay(onEndCall: () -> Unit) {
     Box(modifier = Modifier.fillMaxSize().background(Color(0xF2101010)), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(Icons.Default.Phone, null, modifier = Modifier.size(100.dp), tint = Color(0xFF00E5FF))
             Spacer(modifier = Modifier.height(16.dp))
-            Text("🔴 Canlı VoIP Görüşmesi Sürüyor", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text("16kHz PCM Çift Yönlü Mikrofon Aktif", color = Color.LightGray)
+            Text("🔴 Canlı VoIP Telsiz Görüşmesi Sürüyor", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text("16kHz PCM Canlı Ses Akışı", color = Color.LightGray)
             Spacer(modifier = Modifier.height(48.dp))
             Button(
                 onClick = onEndCall,
