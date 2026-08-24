@@ -21,14 +21,11 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Configure SDK & Accept Licenses
-        run: |
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          yes | sdkmanager --licenses || true
+      - name: Accept SDK Licenses
+        run: yes | sdkmanager --licenses || true
 
       - name: Build APK with Gradle
         run: |
-          gradle wrapper --gradle-version 8.7
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon
 
